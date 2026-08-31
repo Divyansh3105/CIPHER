@@ -1,0 +1,19 @@
+# Node
+node_modules/
+.next/
+out/
+.env
+.env.local
+npm-debug.log*
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+
+# General
+.DS_Store
+*.log
