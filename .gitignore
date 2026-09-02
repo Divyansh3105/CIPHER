@@ -17,3 +17,6 @@ venv/
 # General
 .DS_Store
 *.log
+
+# Claude Code local tooling config
+.claude/
