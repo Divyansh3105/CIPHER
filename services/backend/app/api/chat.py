@@ -1,4 +1,5 @@
 """Chat endpoints: POST /chat/message, GET /chat/conversations[/{id}]."""
+import logging
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -18,7 +19,9 @@ from app.models.schemas import (
     ConversationOut,
     MessageOut,
 )
-from app.personas.jarvis import JARVIS_SYSTEM_PROMPT
+from app.personas import PERSONAS, build_system_prompt, get_persona
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/chat", tags=["chat"])
 
@@ -41,6 +44,17 @@ def _derive_title(content: str) -> str:
     return title
 
 
+def _label_for_history(message: Message, current_persona_id: str) -> str:
+    """Prefix a prior turn's content with its persona if it differs from the
+    persona now replying, so the model doesn't mistake another persona's
+    words for its own past voice after a mid-conversation switch.
+    """
+    if message.role != "assistant" or message.persona is None or message.persona == current_persona_id:
+        return message.content
+    label = PERSONAS[get_persona(message.persona).id].display_name
+    return f"[{label}] {message.content}"
+
+
 @router.post("/message", response_model=ChatMessageResponse)
 async def send_message(
     payload: ChatMessageRequest,
@@ -50,12 +64,16 @@ async def send_message(
 ) -> ChatMessageResponse:
     if payload.conversation_id is not None:
         conversation = await _get_owned_conversation(session, payload.conversation_id, user_id)
+        persona = get_persona(payload.persona or conversation.persona)
     else:
-        conversation = Conversation(user_id=user_id, persona="jarvis", title=_derive_title(payload.content))
+        persona = get_persona(payload.persona)
+        conversation = Conversation(user_id=user_id, persona=persona.id, title=_derive_title(payload.content))
         session.add(conversation)
         await session.flush()  # assigns conversation.id
 
-    user_message = Message(conversation_id=conversation.id, role="user", content=payload.content, persona="jarvis")
+    user_message = Message(
+        conversation_id=conversation.id, role="user", content=payload.content, persona=persona.id
+    )
     session.add(user_message)
     await session.flush()
 
@@ -66,9 +84,15 @@ async def send_message(
         .limit(HISTORY_LIMIT)
     )
     history = list(reversed(history_result.scalars().all()))
+    mixed_history = any(
+        m.role == "assistant" and m.persona is not None and m.persona != persona.id for m in history
+    )
 
-    llm_messages = [LLMMessage(role="system", content=JARVIS_SYSTEM_PROMPT)]
-    llm_messages += [LLMMessage(role=m.role, content=m.content) for m in history]
+    system_prompt = build_system_prompt(persona, mixed_history=mixed_history)
+    llm_messages = [LLMMessage(role="system", content=system_prompt)]
+    llm_messages += [
+        LLMMessage(role=m.role, content=_label_for_history(m, persona.id)) for m in history
+    ]
 
     try:
         response, fell_back = await llm_router.generate(llm_messages)
@@ -76,13 +100,36 @@ async def send_message(
         await session.rollback()
         raise HTTPException(status_code=502, detail=f"LLM providers unavailable: {exc}") from exc
 
+    reply_content = response.content
+    filtered = False
+    if persona.output_filter is not None:
+        verdict = persona.output_filter(reply_content)
+        if not verdict.allowed:
+            logger.warning(
+                "Output filter tripped: persona=%s rule=%s conversation=%s",
+                persona.id,
+                verdict.rule,
+                conversation.id,
+            )
+            reply_content = persona.refusal_message
+            filtered = True
+
     assistant_message = Message(
         conversation_id=conversation.id,
         role="assistant",
-        content=response.content,
-        persona="jarvis",
+        content=reply_content,
+        persona=persona.id,
     )
     session.add(assistant_message)
+
+    # Write back the persona that answered (always, even if unchanged) so
+    # the conversation reflects a mid-conversation switch, and so this
+    # UPDATE fires `updated_at`'s onupdate -- appending a Message alone never
+    # touches the conversations row, which otherwise leaves
+    # GET /chat/conversations' `ORDER BY updated_at DESC` stuck at creation
+    # order (see app/models/db.py).
+    conversation.persona = persona.id
+
     await session.commit()
     await session.refresh(assistant_message)
 
@@ -91,6 +138,7 @@ async def send_message(
         message=MessageOut.model_validate(assistant_message),
         model_used=response.model,
         fell_back=fell_back,
+        filtered=filtered,
     )
 
 
