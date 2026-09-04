@@ -20,3 +20,4 @@ venv/
 
 # Claude Code local tooling config
 .claude/
+CLAUDE.md
