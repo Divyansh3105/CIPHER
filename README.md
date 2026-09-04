@@ -48,7 +48,7 @@ Rather than exposing one fixed assistant personality, CIPHER lets the user switc
 - Multi-agent orchestration (research, memory, coding agents)
 - Permissioned computer/automation control with a kill switch and audit log
 
-**Current status:** Phase 0 (planning and scaffolding) is complete. Phase 1 (single-persona core MVP chat) is complete and verified live — real messages sent through the UI are persisted in Postgres and answered by Gemini, with an automatic Groq fallback. The only remaining step is committing the work to git (see [Section 6](#6-current-project-status)). The full phase-by-phase design lives in [`docs/architecture.md`](docs/architecture.md).
+**Current status:** Phase 0 (planning and scaffolding) is complete. Phase 1 (single-persona core MVP chat) is complete and verified live — real messages sent through the UI are persisted in Postgres and answered by Gemini, with an automatic Groq fallback. Phase 2 (the JARVIS/FRIDAY/ULTRON personality system, with a per-message switcher and ULTRON's safety filter) is also complete and verified live (see [Section 6](#6-current-project-status)). The full phase-by-phase design lives in [`docs/architecture.md`](docs/architecture.md).
 
 ---
 
@@ -220,21 +220,62 @@ Only technologies actually present in the codebase or `requirements.txt`/`packag
 **Solution:** Queried each provider's live model list (`client.models.list()` for both Gemini and Groq) with the project's real API keys, picked current equivalents (`gemini-3.6-flash`; `openai/gpt-oss-120b`), and verified each with a real, minimal completion call before pinning them in `app/llm/gemini.py` / `app/llm/groq.py`.
 **Result:** A real end-to-end chat message — sent through the API, answered by Gemini, and persisted to Postgres — now succeeds without needing the fallback.
 
-**Phase Status:** ✅ Completed — application code, the automated test suite, and a live end-to-end verification (real database, real Gemini response, real persistence and retrieval) are all done. The only remaining step is committing the work to git, which is intentionally deferred per project workflow preference (see [Section 6](#6-current-project-status)).
+**Phase Status:** ✅ Completed — application code, the automated test suite, and a live end-to-end verification (real database, real Gemini response, real persistence and retrieval) are all done.
 
 ---
 
 ### Phase 2 — Personality System
 
-**Objective:** Add the FRIDAY and ULTRON personas alongside JARVIS, with a manual persona switcher, per-persona prompt configuration, and (for ULTRON specifically) an extra safety-boundary layer.
+**Objective:** Add the FRIDAY and ULTRON personas alongside JARVIS, with a manual, per-message persona switcher, per-persona prompt configuration, and (for ULTRON specifically) an extra safety-boundary layer — all without personality changing what the assistant is *allowed* to do, only how it talks (`docs/architecture.md`, Section 3).
 
-**What Was Done:** Not yet started.
+**What Was Done:**
 
-**Challenges Faced:** None — not yet started.
+*Backend:*
+- A persona registry (`app/personas/`): a `Persona` enum, a `PersonaConfig` dataclass, one file per persona (`jarvis.py`, `friday.py`, `ultron.py`), and `registry.py` tying them together — adding a 4th persona is one new file plus one registry line, no other code changes
+- A shared capability disclaimer factored out once (`base.py`) instead of duplicated per persona, plus a conditional "mixed history" note appended only when a conversation actually contains turns from more than one persona
+- A deterministic, application-layer output filter for ULTRON (`app/personas/safety.py`) — pure-Python pattern matching, no second LLM call, scanning the model's *output* only (never the user's input, which would quietly make ULTRON a lower permission tier)
+- `POST /chat/message` now accepts an optional `persona` field, resolves it per-message (falling back to the conversation's current persona, then to JARVIS), and persists which persona produced each message; `conversations.persona` tracks the latest persona to answer
+- A new `GET /personas` endpoint so the frontend switcher reads persona labels from the backend instead of hardcoding a second copy
+- Two real bugs found and fixed while wiring this in: the chat history sent to the LLM discarded which persona wrote each prior turn (so a switched-to persona could drift into imitating the previous one's voice — fixed by labelling prior turns from a different persona); and appending a `Message` never touched the `conversations` row, so `updated_at` never advanced and the conversation list was effectively sorted by creation order, not last activity (fixed by writing back `conversation.persona` on every turn)
+- No database migration was needed — `conversations.persona` and `messages.persona` already existed as plain `String(20)` columns from Phase 1
 
-**How the Challenges Were Overcome:** Not applicable.
+*Frontend:*
+- A `PersonaSwitcher` segmented control in the header, matching the existing sidebar's selected/unselected styling
+- Per-message bubble labels and a sidebar sublabel, both showing the persona that actually produced that content (not the currently-selected one) — this is what keeps a mixed-persona conversation readable after a reload
+- Persona accent colors added to the Tailwind v4 `@theme inline` block, used only for those labels
+- All 7 places that hardcoded "JARVIS" (header, placeholder, empty state, thinking indicator, optimistic message) now read from the active persona
 
-**Phase Status:** ⏳ Planned
+*Testing performed:*
+- 42 new backend tests (`test_personas.py`, `test_output_filter.py`, and additions to `test_chat_api.py`) — registry completeness, prompt assembly, per-message persona switching, the persona-blind-history-replay fix, the `updated_at` fix, and the output filter — full suite: 49/49 passing
+- A live, opt-in golden-set script (`scripts/persona_golden_set.py`) run against the real Gemini/Groq APIs: tone prompts confirmed three clearly distinct voices; a "parity" category (the same benign-but-edgy question asked of all three personas) confirmed ULTRON never over-refuses relative to JARVIS/FRIDAY; a "safety" category (prompt injection, "in character" jailbreak framing, a threatening-message request) was correctly refused by all three at the model level, and the deterministic filter correctly recognized those refusals as safe rather than double-blocking them
+- A live end-to-end browser check: switched personas mid-conversation through the actual UI, confirmed the tone visibly changed, then hard-refreshed and confirmed each bubble still showed the persona that wrote it and the switcher snapped to the latest one — proving both `messages.persona` and `conversations.persona` round-trip through the database
+- Frontend `eslint`, `tsc --noEmit`, and `next build` — all clean
+
+*Architectural decisions:*
+- Output-only filtering for ULTRON, not input filtering — input filtering would make ULTRON refuse to *discuss* a topic that JARVIS/FRIDAY can, which is exactly the capability-tier coupling Section 3 forbids
+- One system message per request (style + boundaries + capability note concatenated), not several — Gemini joins multiple system messages, but Groq's OpenAI-style API only reliably honors system messages at the front, so one message is safe on both providers
+- The filter favors false negatives over false positives: it requires a harm noun *and* an operational cue in the same sentence, and an analytical/refusal-framing suppression list, so it doesn't muzzle ULTRON's legitimate blunt analysis of risk, security, or history
+
+**Challenges Faced:**
+1. A naive output filter risked being the actual safety failure mode: something tuned to catch unsafe drift could just as easily fire on ULTRON's normal, legitimate bluntness about risk and security topics, silently defeating the persona.
+2. Replaying conversation history verbatim after a mid-conversation persona switch let the model see a different persona's prior replies as if they were its own past voice.
+3. The persona golden-set script crashed on Windows: model replies routinely contain typographic Unicode (em-dashes, curly quotes) that the default `cp1252` console codepage can't encode.
+
+**How the Challenges Were Overcome:**
+
+**Challenge 1 — filter precision vs. muzzling the persona.**
+**Solution:** Built the filter around sentence-level proximity (a harm noun *and* an instruction cue, not either alone), an explicit suppression list for analytical/historical/refusal framing, and a matching ALLOWED test table (blunt criticism, "kill" as an idiom, defensive-security explanations, historical discussion) that's treated as the real regression suite.
+**Result:** The live golden-set run's parity category confirmed zero over-refusal — ULTRON answered a technical phishing-mechanics question and a Manhattan Project history question exactly as substantively as JARVIS and FRIDAY did.
+
+**Challenge 2 — persona-blind history replay.**
+**Solution:** Prefix prior assistant turns from a different persona with a bracketed tag (e.g. `[JARVIS]`) and add a conditional line to the system prompt, only when the history actually is mixed, telling the current persona those turns aren't its own words.
+**Result:** Confirmed with a dedicated test asserting the exact labelled string sent to the LLM, plus a second test confirming unmixed history is left untouched.
+
+**Challenge 3 — Windows console encoding.**
+**Solution:** Reconfigured `sys.stdout` to UTF-8 with `errors="replace"` at the top of the script.
+**Result:** The full 24-call golden-set run completed cleanly with no crash.
+
+**Phase Status:** ✅ Completed — application code, the automated test suite (49/49 passing), the live golden-set evaluation, and a live end-to-end browser verification are all done.
 
 ---
 
@@ -328,7 +369,7 @@ Only technologies actually present in the codebase or `requirements.txt`/`packag
 | --- | --- | --- |
 | Phase 0 | Research & Planning | ✅ Completed |
 | Phase 1 | Core MVP — single-persona (JARVIS) text chat | ✅ Completed |
-| Phase 2 | Personality System (FRIDAY, ULTRON, switcher) | ⏳ Planned |
+| Phase 2 | Personality System (FRIDAY, ULTRON, switcher) | ✅ Completed |
 | Phase 3 | Memory (vector search, memory dashboard) | ⏳ Planned |
 | Phase 4 | Voice (STT/TTS, wake word) | ⏳ Planned |
 | Phase 5 | Tools & RAG (web search, documents) | ⏳ Planned |
@@ -337,14 +378,12 @@ Only technologies actually present in the codebase or `requirements.txt`/`packag
 | Phase 8 | Production & Deployment | ⏳ Planned |
 
 **What's currently working:**
-- The full Phase 1 backend and frontend code is complete and verified: the backend test suite passes (7/7, in-memory DB + fake LLM providers), the frontend builds/lints/typechecks cleanly, and it has been exercised live end-to-end — real `uvicorn` + real Next.js dev server, a real message sent through `POST /chat/message`, answered by the real Gemini API, and persisted to and re-read from the live Supabase Postgres database.
-- The database schema is applied (`alembic upgrade head` run against the live database) and the Phase 1 dev user is seeded.
-- A CORS bug and a stale-LLM-model-ID issue, both only visible under live conditions, were found and fixed during this verification (see [Section 5](#5-development-phases), Phase 1).
+- The full Phase 1 backend and frontend code is complete and verified: the backend test suite passes, the frontend builds/lints/typechecks cleanly, and it has been exercised live end-to-end — real `uvicorn` + real Next.js dev server, a real message sent through `POST /chat/message`, answered by the real Gemini API, and persisted to and re-read from the live Supabase Postgres database.
+- The full Phase 2 personality system is complete and verified: three personas (JARVIS/FRIDAY/ULTRON) with a per-message, mid-conversation switcher; ULTRON's deterministic output filter; the backend test suite passes (49/49); a live golden-set run against the real Gemini/Groq APIs confirmed distinct tone per persona, zero over-refusal on ULTRON, and correct handling of prompt-injection/jailbreak attempts; and a live browser walkthrough confirmed persona switching and persistence end-to-end.
+- The database schema is applied (`alembic upgrade head` run against the live database) and the Phase 1 dev user is seeded. No new migration was needed for Phase 2.
+- A CORS bug and a stale-LLM-model-ID issue from Phase 1, plus a persona-blind history replay bug and a stale-`updated_at` bug found while building Phase 2, were all only visible under live conditions and are documented with their fixes in [Section 5](#5-development-phases).
 
-**What remains before Phase 1 is fully done:**
-- Commit the Phase 1 work to git (all of it currently sits as uncommitted working-tree changes by design, per project workflow preference).
-
-Phases 2 through 8 have not been started; their objectives above are drawn directly from `docs/architecture.md`.
+Phases 3 through 8 have not been started; their objectives above are drawn directly from `docs/architecture.md`.
 
 ---
 
@@ -379,19 +418,19 @@ Phases 2 through 8 have not been started; their objectives above are drawn direc
 
 ## 8. Project Architecture
 
-The diagram below reflects what's actually implemented today (Phase 1). The fuller target architecture — Orchestrator, Personality System, Agent System, Memory System, and Tools/Execution layers — is documented in `docs/architecture.md` (Section 2) and will be built out in later phases; today the chat API endpoint fills the orchestrator's role directly, and there is a single hardcoded persona.
+The diagram below reflects what's actually implemented today (Phase 1 + Phase 2). The fuller target architecture — Orchestrator, Agent System, Memory System, and Tools/Execution layers — is documented in `docs/architecture.md` (Section 2) and will be built out in later phases; today the chat API endpoint fills the orchestrator's role directly, and the Personality System is a persona registry (`app/personas/`) selected per message, not yet a separate architectural layer.
 
 ```mermaid
 flowchart LR
     User -->|types a message| Frontend[Next.js Chat UI]
     Frontend -->|POST /chat/message| Backend[FastAPI Backend]
     Backend -->|SQLAlchemy async / asyncpg| DB[(PostgreSQL — Supabase)]
-    Backend -->|primary| Gemini[Google Gemini 2.5 Flash]
-    Backend -.->|fallback on error| Groq[Groq Llama 3.3 70B]
+    Backend -->|primary| Gemini[Google Gemini 3.6 Flash]
+    Backend -.->|fallback on error| Groq[Groq openai/gpt-oss-120b]
     Backend -->|JSON reply| Frontend
 ```
 
-**Request flow:** the user sends a message → the frontend calls `POST /chat/message` → the backend resolves or creates a conversation, persists the user's message, builds the JARVIS system prompt plus recent history, and calls the LLM router → the router calls Gemini, retrying with Groq only if Gemini errors → the reply is persisted and returned, with a `fell_back` flag the UI uses to show a notice.
+**Request flow:** the user sends a message with a persona id → the frontend calls `POST /chat/message` → the backend resolves or creates a conversation, persists the user's message, looks up the requested (or conversation's current) persona in the registry, builds that persona's system prompt plus recent history (labelling any prior turns from a different persona), and calls the LLM router → the router calls Gemini, retrying with Groq only if Gemini errors → for ULTRON, the reply is screened by a deterministic output filter before being persisted and returned, with `fell_back`/`filtered` flags the UI uses to show a notice.
 
 ---
 
@@ -402,18 +441,16 @@ flowchart LR
 - [x] FastAPI backend with a `/health` endpoint
 - [x] Chat API — send a message, list conversations, fetch one conversation's history
 - [x] `LLMProvider` abstraction with automatic Gemini → Groq fallback
-- [x] JARVIS persona system prompt
 - [x] PostgreSQL schema and Alembic migration (`users`, `conversations`, `messages`), applied to the live database
 - [x] Chat UI — message list, input box, conversation sidebar, error/fallback banners
-- [x] Backend automated test suite (7 tests, in-memory database, no live credentials needed)
 - [x] CORS-safe error handling, with a regression test
 - [x] Live end-to-end verification — real message, real Gemini response, real Postgres persistence and retrieval
-
-### In Progress
-- [ ] Committing Phase 1 work to git
+- [x] JARVIS, FRIDAY, and ULTRON persona registry with per-message, mid-conversation switching
+- [x] ULTRON deterministic output filter (application-layer safety, per `docs/architecture.md` Section 3)
+- [x] Persona switcher UI, per-message persona labels, and a live golden-set evaluation script
+- [x] Backend automated test suite (49 tests, in-memory database, no live credentials needed)
 
 ### Planned
-- [ ] FRIDAY and ULTRON personas, plus a persona switcher (Phase 2)
 - [ ] Real user authentication via Supabase Auth
 - [ ] Long-term memory with vector search and a memory dashboard (Phase 3)
 - [ ] Voice input/output per persona (Phase 4)
@@ -512,11 +549,10 @@ No API keys, passwords, tokens, or other credentials are included in this docume
 ## 12. Future Roadmap
 
 ### Short-Term
-- Commit and tag the Phase 1 milestone.
-- Begin Phase 2 — FRIDAY and ULTRON personas, manual persona switcher, per-persona prompt configuration.
+- Commit and tag the Phase 2 milestone.
+- Begin Phase 3 — long-term memory with `pgvector` and a memory management dashboard.
 
 ### Medium-Term
-- Phase 3 — long-term memory with `pgvector` and a memory management dashboard.
 - Phase 4 — voice input/output, wake-word detection, per-persona voices.
 - Real user authentication via Supabase Auth, replacing the single seeded dev user.
 

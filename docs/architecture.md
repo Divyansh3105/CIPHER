@@ -138,6 +138,7 @@ All three personas share **one underlying LLM** (or a small set of models via th
 - **Voice:** Lower-pitched, more deliberate-paced TTS voice.
 - **Tool access:** Identical to the other two personas — ULTRON is a _style_, not a _permission tier_. This is an important design decision: personality never changes what the assistant is allowed to do, only how it talks.
 - **Best for:** Devil's-advocate analysis, risk assessment, blunt second opinions.
+- **Implementation note (Phase 2):** the application-layer filter screens the model's *output* only, never the user's input — an input filter would make ULTRON refuse to discuss a topic JARVIS/FRIDAY can, which is exactly the capability-tier coupling the "style, not permission tier" rule above forbids. It's deterministic pattern matching (`services/backend/app/personas/safety.py`), not a second LLM call, and is deliberately tuned toward false negatives over false positives: it requires a harm noun *and* an operational cue in the same sentence, with an analytical/refusal-framing suppression list, so it doesn't block ULTRON's legitimate blunt analysis of violence, risk, or security topics. It is a backstop, not the primary mechanism — the system prompt and the provider's own safety training do the real work.
 
 ### Cross-cutting design notes
 
