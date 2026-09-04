@@ -1,5 +1,8 @@
-// Typed client for the FastAPI backend (services/backend). Phase 1 only:
-// send a message, list conversations, fetch one conversation's history.
+// Typed client for the FastAPI backend (services/backend). Phase 2: chat plus
+// a 3-way persona switcher (JARVIS/FRIDAY/ULTRON) -- persona is sent per
+// message and can change mid-conversation.
+
+import type { Persona, PersonaInfo } from "@/lib/personas";
 
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
 
@@ -9,7 +12,7 @@ export interface ChatMessage {
   id: string;
   role: Role;
   content: string;
-  persona: string | null;
+  persona: Persona | null;
   created_at: string;
 }
 
@@ -18,11 +21,14 @@ export interface ChatMessageResponse {
   message: ChatMessage;
   model_used: string;
   fell_back: boolean;
+  // True when the persona's output filter (ULTRON only, today) replaced the
+  // model's reply with a safety refusal.
+  filtered: boolean;
 }
 
 export interface ConversationSummary {
   id: string;
-  persona: string;
+  persona: Persona;
   title: string | null;
   created_at: string;
   updated_at: string;
@@ -67,10 +73,14 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return response.json() as Promise<T>;
 }
 
-export function sendMessage(content: string, conversationId?: string): Promise<ChatMessageResponse> {
+export function sendMessage(
+  content: string,
+  conversationId?: string,
+  persona?: Persona
+): Promise<ChatMessageResponse> {
   return request<ChatMessageResponse>("/chat/message", {
     method: "POST",
-    body: JSON.stringify({ content, conversation_id: conversationId ?? null }),
+    body: JSON.stringify({ content, conversation_id: conversationId ?? null, persona: persona ?? null }),
   });
 }
 
@@ -80,4 +90,8 @@ export function listConversations(): Promise<ConversationSummary[]> {
 
 export function getConversation(id: string): Promise<ConversationDetail> {
   return request<ConversationDetail>(`/chat/conversations/${id}`);
+}
+
+export function listPersonas(): Promise<PersonaInfo[]> {
+  return request<PersonaInfo[]>("/personas");
 }

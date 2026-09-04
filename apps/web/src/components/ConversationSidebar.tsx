@@ -1,15 +1,18 @@
 "use client";
 
 import type { ConversationSummary } from "@/lib/api";
+import { type PersonaInfo, personaLabel } from "@/lib/personas";
 
 export default function ConversationSidebar({
   conversations,
   activeId,
+  personas,
   onSelect,
   onNewChat,
 }: {
   conversations: ConversationSummary[];
   activeId: string | null;
+  personas: PersonaInfo[];
   onSelect: (id: string) => void;
   onNewChat: () => void;
 }) {
@@ -29,21 +32,36 @@ export default function ConversationSidebar({
           <p className="px-2 py-4 text-xs text-zinc-500 dark:text-zinc-400">No conversations yet.</p>
         )}
         <ul className="flex flex-col gap-1">
-          {conversations.map((conversation) => (
-            <li key={conversation.id}>
-              <button
-                type="button"
-                onClick={() => onSelect(conversation.id)}
-                className={`w-full truncate rounded-lg px-3 py-2 text-left text-sm ${
-                  conversation.id === activeId
-                    ? "bg-zinc-900 text-zinc-50 dark:bg-zinc-100 dark:text-zinc-900"
-                    : "hover:bg-zinc-100 dark:hover:bg-zinc-800"
-                }`}
-              >
-                {conversation.title || "Untitled conversation"}
-              </button>
-            </li>
-          ))}
+          {conversations.map((conversation) => {
+            const selected = conversation.id === activeId;
+            return (
+              <li key={conversation.id}>
+                <button
+                  type="button"
+                  onClick={() => onSelect(conversation.id)}
+                  className={`w-full rounded-lg px-3 py-2 text-left ${
+                    selected
+                      ? "bg-zinc-900 text-zinc-50 dark:bg-zinc-100 dark:text-zinc-900"
+                      : "hover:bg-zinc-100 dark:hover:bg-zinc-800"
+                  }`}
+                >
+                  <span className="block truncate text-sm">
+                    {conversation.title || "Untitled conversation"}
+                  </span>
+                  {/* A selected item's background is zinc-900, so the normal
+                      muted text color is nearly invisible on it -- this has
+                      to be conditional, not cosmetic. */}
+                  <span
+                    className={`block text-xs font-semibold uppercase tracking-wide ${
+                      selected ? "text-zinc-400 dark:text-zinc-500" : "text-zinc-500 dark:text-zinc-400"
+                    }`}
+                  >
+                    {personaLabel(personas, conversation.persona)}
+                  </span>
+                </button>
+              </li>
+            );
+          })}
         </ul>
       </nav>
     </aside>

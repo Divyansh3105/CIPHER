@@ -3,11 +3,20 @@
 :root {
   --background: #ffffff;
   --foreground: #171717;
+
+  /* Persona accent colors -- used only for the message-bubble label and the
+     sidebar's persona sublabel, never for the zinc-based chrome. */
+  --persona-jarvis: #4f46e5;
+  --persona-friday: #d97706;
+  --persona-ultron: #dc2626;
 }
 
 @theme inline {
   --color-background: var(--background);
   --color-foreground: var(--foreground);
+  --color-persona-jarvis: var(--persona-jarvis);
+  --color-persona-friday: var(--persona-friday);
+  --color-persona-ultron: var(--persona-ultron);
   --font-sans: var(--font-geist-sans);
   --font-mono: var(--font-geist-mono);
 }
@@ -16,6 +25,10 @@
   :root {
     --background: #0a0a0a;
     --foreground: #ededed;
+
+    --persona-jarvis: #818cf8;
+    --persona-friday: #fbbf24;
+    --persona-ultron: #f87171;
   }
 }
 

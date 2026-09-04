@@ -4,14 +4,17 @@ import { useCallback, useEffect, useState } from "react";
 import ConversationSidebar from "@/components/ConversationSidebar";
 import MessageList from "@/components/MessageList";
 import ChatInput from "@/components/ChatInput";
+import PersonaSwitcher from "@/components/PersonaSwitcher";
 import {
   ApiError,
   type ChatMessage,
   type ConversationSummary,
   getConversation,
   listConversations,
+  listPersonas,
   sendMessage,
 } from "@/lib/api";
+import { DEFAULT_PERSONA, FALLBACK_PERSONAS, type Persona, personaLabel } from "@/lib/personas";
 
 export default function Home() {
   const [conversations, setConversations] = useState<ConversationSummary[]>([]);
@@ -20,6 +23,8 @@ export default function Home() {
   const [pending, setPending] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  const [persona, setPersona] = useState<Persona>(DEFAULT_PERSONA);
+  const [personas, setPersonas] = useState(FALLBACK_PERSONAS);
 
   const refreshConversations = useCallback(async () => {
     try {
@@ -38,6 +43,13 @@ export default function Home() {
       .catch(() => {
         // Non-fatal: the sidebar just stays stale/empty if this fails.
       });
+    listPersonas()
+      .then((result) => {
+        if (!cancelled && result.length > 0) setPersonas(result);
+      })
+      .catch(() => {
+        // Non-fatal: FALLBACK_PERSONAS keeps the switcher usable.
+      });
     return () => {
       cancelled = true;
     };
@@ -50,6 +62,7 @@ export default function Home() {
       const detail = await getConversation(id);
       setActiveId(detail.id);
       setMessages(detail.messages);
+      setPersona(detail.persona);
     } catch (err) {
       setError(err instanceof ApiError ? err.message : "Failed to load conversation.");
     }
@@ -60,6 +73,8 @@ export default function Home() {
     setMessages([]);
     setError(null);
     setNotice(null);
+    // Deliberately keep the current persona selection -- switching persona
+    // shouldn't reset it, and it's the natural persona to start a new chat with.
   }
 
   async function handleSend(content: string) {
@@ -70,17 +85,21 @@ export default function Home() {
       id: `pending-${crypto.randomUUID()}`,
       role: "user",
       content,
-      persona: "jarvis",
+      persona,
       created_at: new Date().toISOString(),
     };
     setMessages((prev) => [...prev, optimisticUserMessage]);
     setPending(true);
 
     try {
-      const result = await sendMessage(content, activeId ?? undefined);
+      const result = await sendMessage(content, activeId ?? undefined, persona);
       setActiveId(result.conversation_id);
       setMessages((prev) => [...prev, result.message]);
-      if (result.fell_back) {
+      if (result.filtered) {
+        setNotice(
+          `${personaLabel(personas, result.message.persona)}'s safety filter replaced that reply -- it crossed a line the persona enforces.`
+        );
+      } else if (result.fell_back) {
         setNotice(`Primary model was unavailable — replied using the fallback model (${result.model_used}).`);
       }
       refreshConversations();
@@ -91,19 +110,23 @@ export default function Home() {
     }
   }
 
+  const activeLabel = personaLabel(personas, persona);
+
   return (
     <div className="flex flex-1 bg-white dark:bg-black">
       <ConversationSidebar
         conversations={conversations}
         activeId={activeId}
+        personas={personas}
         onSelect={handleSelectConversation}
         onNewChat={handleNewChat}
       />
       <div className="flex flex-1 flex-col">
-        <header className="border-b border-zinc-200 px-4 py-3 dark:border-zinc-800">
+        <header className="flex items-center justify-between border-b border-zinc-200 px-4 py-3 dark:border-zinc-800">
           <h1 className="text-sm font-semibold tracking-wide text-zinc-900 dark:text-zinc-100">
-            CIPHER — JARVIS
+            CIPHER — {activeLabel}
           </h1>
+          <PersonaSwitcher personas={personas} value={persona} onChange={setPersona} disabled={pending} />
         </header>
 
         {notice && (
@@ -117,8 +140,13 @@ export default function Home() {
           </div>
         )}
 
-        <MessageList messages={messages} pending={pending} />
-        <ChatInput disabled={pending} onSend={handleSend} />
+        <MessageList
+          messages={messages}
+          pending={pending}
+          activePersonaLabel={activeLabel}
+          personas={personas}
+        />
+        <ChatInput disabled={pending} personaLabel={activeLabel} onSend={handleSend} />
       </div>
     </div>
   );

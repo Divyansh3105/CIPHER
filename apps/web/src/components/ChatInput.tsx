@@ -5,9 +5,11 @@ import type { KeyboardEvent } from "react";
 
 export default function ChatInput({
   disabled,
+  personaLabel,
   onSend,
 }: {
   disabled: boolean;
+  personaLabel: string;
   onSend: (content: string) => void;
 }) {
   const [value, setValue] = useState("");
@@ -31,7 +33,7 @@ export default function ChatInput({
       <textarea
         className="flex-1 resize-none rounded-xl border border-zinc-300 bg-transparent px-3 py-2 text-sm outline-none focus:border-zinc-500 dark:border-zinc-700 dark:focus:border-zinc-400"
         rows={1}
-        placeholder="Message JARVIS…"
+        placeholder={`Message ${personaLabel}…`}
         value={value}
         disabled={disabled}
         onChange={(e) => setValue(e.target.value)}
