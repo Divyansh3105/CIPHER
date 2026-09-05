@@ -45,3 +45,19 @@ async def get_session() -> AsyncGenerator[AsyncSession, None]:
     """FastAPI dependency yielding a request-scoped DB session."""
     async with async_session_factory() as session:
         yield session
+
+
+def get_session_factory() -> async_sessionmaker[AsyncSession]:
+    """FastAPI dependency yielding the session *factory*, for work that must
+    outlive the request -- specifically the Phase 3 background memory-capture
+    task (app/memory/capture.py).
+
+    This exists as its own overridable dependency for exactly one reason:
+    without it, the background task would close over the module-level
+    `async_session_factory` above, which is bound to whatever DATABASE_URL was
+    set at import time -- the *real* one in tests/conftest.py. Tests override
+    this dependency the same way they override get_session, so background
+    memory writes stay on the in-memory SQLite DB instead of attempting a live
+    Postgres connection.
+    """
+    return async_session_factory

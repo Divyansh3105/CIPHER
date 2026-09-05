@@ -6,6 +6,7 @@ from fastapi.responses import JSONResponse
 from sqlalchemy.exc import SQLAlchemyError
 
 from app.api.chat import router as chat_router
+from app.api.memory import router as memory_router
 from app.api.personas import router as personas_router
 from app.core.config import get_settings
 
@@ -23,6 +24,7 @@ app.add_middleware(
 )
 
 app.include_router(chat_router)
+app.include_router(memory_router)
 app.include_router(personas_router)
 
 

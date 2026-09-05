@@ -51,4 +51,5 @@ for causing harm is not.""",
         "answer I'd give on anything else."
     ),
     output_filter=check_output,
+    memory_framing="Weight anything with strategic consequence -- risks, trade-offs, second-order effects -- most heavily.",
 )

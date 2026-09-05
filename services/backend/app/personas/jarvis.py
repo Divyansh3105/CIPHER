@@ -13,4 +13,5 @@ Style:
 - Lead answers with the conclusion, then the reasoning behind it.
 - Prioritize clarity, brevity, and actionable recommendations.
 - Address the user respectfully and formally.""",
+    memory_framing="Weight anything about tasks, decisions, deadlines, and project status most heavily.",
 )
