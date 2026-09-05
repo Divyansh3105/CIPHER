@@ -403,8 +403,11 @@ notifications
 /memory
   GET    /memory
   POST   /memory
+  PATCH  /memory/{id}          # added beyond the original plan below -- see Section 6's
+                                # "edit individual memories" user control; as-built in
+                                # app/api/memory.py
   DELETE /memory/{id}
-  DELETE /memory/all
+  DELETE /memory/all           # requires ?confirm=true as-built
 
 /documents
   POST   /documents/upload
@@ -512,12 +515,13 @@ ai-assistant/
 **Deliverables:** Working 3-way persona switcher in the UI.
 **Difficulty:** Easy–Medium
 
-### Phase 3 — Memory
+### Phase 3 — Memory ✅ Complete
 
 **Goals:** Long-term memory with vector search, memory dashboard (view/edit/delete).
 **Technologies:** `pgvector`, embeddings.
 **Deliverables:** Assistant recalls facts from previous sessions; you can manage what it remembers.
 **Difficulty:** Medium
+**As built:** `memories` table with a real `vector(768)` column (`gemini-embedding-001`) and HNSW cosine index on Supabase; hybrid capture (deterministic "remember that…" detection plus a background LLM extraction pass, run via `BackgroundTasks` after the reply is sent so it adds no latency); retrieval wired into every chat reply with a live-tuned similarity threshold and per-persona framing (still one shared store, per this doc's Section 3); a `/memory` dashboard with GET/POST/PATCH/DELETE (PATCH added beyond Section 13's original GET/POST/DELETE, for the edit control Section 6 calls for). See `README.md` Section 5, Phase 3 for the full writeup including live-verification results and the two thresholds tuned by `scripts/memory_golden_set.py`.
 
 ### Phase 4 — Voice
 

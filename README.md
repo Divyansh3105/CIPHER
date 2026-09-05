@@ -48,7 +48,7 @@ Rather than exposing one fixed assistant personality, CIPHER lets the user switc
 - Multi-agent orchestration (research, memory, coding agents)
 - Permissioned computer/automation control with a kill switch and audit log
 
-**Current status:** Phase 0 (planning and scaffolding) is complete. Phase 1 (single-persona core MVP chat) is complete and verified live — real messages sent through the UI are persisted in Postgres and answered by Gemini, with an automatic Groq fallback. Phase 2 (the JARVIS/FRIDAY/ULTRON personality system, with a per-message switcher and ULTRON's safety filter) is also complete and verified live (see [Section 6](#6-current-project-status)). The full phase-by-phase design lives in [`docs/architecture.md`](docs/architecture.md).
+**Current status:** Phase 0 (planning and scaffolding) is complete. Phase 1 (single-persona core MVP chat) is complete and verified live — real messages sent through the UI are persisted in Postgres and answered by Gemini, with an automatic Groq fallback. Phase 2 (the JARVIS/FRIDAY/ULTRON personality system, with a per-message switcher and ULTRON's safety filter) is also complete and verified live. Phase 3 (long-term memory via `pgvector`, hybrid capture, and a memory dashboard) is complete and verified live as well (see [Section 6](#6-current-project-status)). The full phase-by-phase design lives in [`docs/architecture.md`](docs/architecture.md).
 
 ---
 
@@ -100,12 +100,13 @@ Rather than exposing one fixed assistant personality, CIPHER lets the user switc
 | Database | PostgreSQL (via Supabase) | Persisted users, conversations, messages |
 | ORM / Migrations | SQLAlchemy 2.0 (async) + asyncpg, Alembic | Async DB access; versioned schema migrations |
 | AI/ML | Google Gemini (`gemini-3.6-flash`) via `google-genai`; Groq (`openai/gpt-oss-120b`) via `groq` | Primary and automatic-fallback response generation |
+| Vector memory | `pgvector` extension on Supabase Postgres; `gemini-embedding-001` (768 dims) via `google-genai` | Long-term memory storage and similarity search (Phase 3) — no new Python dependency, since embeddings go through the same `google-genai` client already used for chat |
 | Authentication | Supabase Auth — **planned, not yet implemented** | Phase 1 uses a single seeded dev user instead (see [Section 5](#5-development-phases)) |
 | Testing | pytest, pytest-asyncio, httpx, aiosqlite | Backend unit + integration tests, run against an in-memory DB |
 | Deployment | **Not yet configured.** Planned: Vercel (frontend) + Render/Railway (backend) + Supabase (DB), per `docs/architecture.md` Section 19 | — |
 | Other | ESLint (`eslint-config-next`), Turbopack (via `next dev`) | Linting; dev-server bundling |
 
-Only technologies actually present in the codebase or `requirements.txt`/`package.json` are listed above. `pgvector`, Whisper, Edge-TTS, and LangGraph appear in the target architecture doc for later phases but are not yet dependencies of this project.
+Only technologies actually present in the codebase or `requirements.txt`/`package.json` are listed above. Whisper, Edge-TTS, and LangGraph appear in the target architecture doc for later phases but are not yet dependencies of this project.
 
 ---
 
@@ -283,13 +284,58 @@ Only technologies actually present in the codebase or `requirements.txt`/`packag
 
 **Objective:** Long-term memory with vector search (via `pgvector`), plus a dashboard for viewing, editing, and deleting what the assistant remembers.
 
-**What Was Done:** Not yet started.
+**What Was Done:**
 
-**Challenges Faced:** None — not yet started.
+*Backend:*
+- A `memories` table (Alembic migration `0002_memories.py`) with a real `vector(768)` column and an HNSW cosine index, alongside a `messages.recalled_memories` JSONB column
+- A dialect-portable `Embedding` column type (`app/models/vector.py`) that compiles to `vector(768)` on Postgres and `TEXT` on SQLite, so the test suite still needs no live Postgres — with the embedding column always `deferred` on the ORM side, since asyncpg has no codec for `vector` and every read/write of it goes through hand-written SQL with an explicit cast instead
+- An `Embedder` abstraction (`app/memory/embedder.py`) — `GeminiEmbedder` wrapping `gemini-embedding-001` at 768 output dimensions, L2-normalized client-side, with query/document-asymmetric embedding
+- A `MemoryStore` abstraction (`app/memory/store.py`) — `PgVectorStore` for real cosine similarity search plus two-layer deduplication (an exact content-hash check, then a semantic-similarity check against existing memories)
+- Hybrid memory capture (`app/memory/capture.py`): a deterministic "remember that…" detector, plus a background LLM extraction pass that pulls durable facts out of ordinary messages — both run as a `BackgroundTasks` callback *after* the chat reply is already sent, so capture adds no user-visible latency
+- Retrieval wired into `POST /chat/message`: the user's message is embedded, the top-5 most similar memories above a similarity threshold are fetched and injected into the system prompt (framed differently per persona — JARVIS weighs tasks/decisions, FRIDAY weighs preferences/feelings, ULTRON weighs strategic risk — though all three personas share exactly one memory store), and a snapshot of what was actually recalled is persisted on the assistant's own message row so it survives a later edit or delete of that memory
+- A `/memory` REST API (`app/api/memory.py`): `GET`/`POST`/`PATCH`/`DELETE /memory/{id}`, plus `DELETE /memory/all` behind an explicit `?confirm=true` — deviating from the original architecture doc by adding `PATCH`, since "edit a memory" is an explicit user control the doc itself calls for
+- The persona system's shared capability note (`app/personas/base.py`), which previously told every persona to flatly deny having memory, was rewritten to describe the new recall mechanism instead, while still forbidding confabulation when nothing relevant was recalled
 
-**How the Challenges Were Overcome:** Not applicable.
+*Frontend:*
+- A `/memory` dashboard page — add a memory by hand, edit or delete any stored memory, and a "Forget everything" action behind a confirmation dialog
+- "Recalled" chips on assistant chat bubbles showing which stored memories were actually used to answer that message, surviving a reload since they're read from the persisted snapshot rather than re-queried live
 
-**Phase Status:** ⏳ Planned
+*Testing performed:*
+- 53 new backend tests (dedup, similarity search and user-scoping, the explicit-vs-question detector, the `/memory` API, retrieval wired into chat) — full suite: 102/102 passing, all against an in-memory SQLite database and fake embedder/LLM provider, no live credentials needed
+- A live, opt-in golden-set script (`scripts/memory_golden_set.py`) run against the real Gemini embedding model: a similarity matrix over an 8-memory/10-query corpus was used to pick the recall threshold (0.65, chosen because it had zero missed real matches while raising the bar further started costing recall), and a paraphrase/near-miss corpus for the dedup threshold surfaced a real limitation — genuine paraphrases and same-topic-but-different-value facts (e.g. two different flight dates) overlap in similarity score, so the threshold (0.975) was set to favor never merging two genuinely different facts, at the cost of occasionally missing a real paraphrase
+- A live end-to-end verification: seeded a memory via the API, asked a related question through real chat, confirmed the reply correctly recalled it with a similarity score; sent an explicit "remember that…" message and confirmed it was captured verbatim, while a "do you remember…?" question created nothing; sent an ordinary message and confirmed the background extraction pass pulled out separate semantic facts from it; resent the same explicit fact and confirmed no duplicate row was created
+- Frontend `next build` clean; a live browser walkthrough of the dashboard (create/edit/delete/forget-everything) and of a recalled-memory chip surviving a full conversation reload
+
+*Architectural decisions:*
+- Auth stays deferred (per Phase 1's decision) — every memory is correctly scoped by `user_id` throughout, so real auth remains a drop-in change to one function later, but building it out was kept out of this phase's scope
+- Recalled-memory chips are a denormalized snapshot on the message row, not a live join to the `memories` table — a chip must keep showing what the model actually saw when it generated that specific reply, even after the underlying memory is later edited or deleted
+- All three personas read from one shared memory store, never filtered by which persona captured a fact — only the *framing* of retrieved memories in the prompt differs per persona, matching the architecture doc's explicit "one user, not three" memory model
+
+**Challenges Faced:**
+1. asyncpg has no wire codec for pgvector's `vector` type, and registering one costs a type-introspection round trip per connection — expensive given the project's `NullPool`-per-request Supavisor setup from Phase 1.
+2. A background task queued from inside a request handler can't reuse that request's database session, since the session is scoped to the request's lifecycle.
+3. The real embedding model's similarity and deduplication thresholds couldn't be picked by guesswork — and once measured, the data showed the two duplicate-detection goals (catch real paraphrases, never merge two different facts) don't have one threshold that satisfies both perfectly.
+4. The very first live similarity test after wiring retrieval into chat came back empty despite a directly-verified 0.74 cosine similarity between the stored memory and the query.
+
+**How the Challenges Were Overcome:**
+
+**Challenge 1 — no asyncpg codec for `vector`.**
+**Solution:** Declared the embedding column `deferred=True` so a plain `SELECT` never fetches it, and confined every actual read/write of it to hand-written SQL in `app/memory/store.py` using `CAST(:embedding AS vector)` on a `text`-typed bind parameter — asyncpg never has to encode or decode a `vector` value directly, on either side.
+**Result:** Live writes and cosine-similarity reads against the real Supabase `vector(768)` column both work correctly, verified directly against the database before wiring retrieval into chat at all.
+
+**Challenge 2 — a background task can't reuse the request's session.**
+**Solution:** Added a `get_session_factory` FastAPI dependency (separate from `get_session`) that the background writer uses to open its own session after the response has been sent, overridable in tests the same way `get_session` already is.
+**Result:** Memory capture runs to completion without holding the request's connection open, and the test suite can verify it without hitting a live database.
+
+**Challenge 3 — no single dedup threshold satisfies both goals.**
+**Solution:** Measured real cosine similarities across a labeled corpus of true paraphrases and true near-misses with `scripts/memory_golden_set.py`, found their similarity ranges genuinely overlap, and deliberately picked the threshold that never merges two different facts — accepting that a few real paraphrases won't get deduplicated, since a missed dedup just leaves a second row the user can delete, while a wrongful merge silently loses information.
+**Result:** A documented, data-backed threshold instead of a guessed one, with the tradeoff written down in `app/memory/store.py` for whoever revisits it later.
+
+**Challenge 4 — recall silently returned nothing despite a directly-verified match.**
+**Solution:** Traced it to a stale `uvicorn` process still running from an earlier manual test, serving the pre-retrieval version of the chat endpoint, rather than a code bug — killed the leftover process and restarted.
+**Result:** A reminder that live manual verification needs the same "is this actually the code I think is running" discipline as any other debugging, especially with background processes started ad hoc during testing.
+
+**Phase Status:** ✅ Completed — application code, the automated test suite (102/102 passing), the live golden-set threshold tuning, and a live end-to-end verification (real Supabase pgvector writes/reads, real Gemini embeddings, real chat recall, real background capture) are all done.
 
 ---
 
@@ -370,7 +416,7 @@ Only technologies actually present in the codebase or `requirements.txt`/`packag
 | Phase 0 | Research & Planning | ✅ Completed |
 | Phase 1 | Core MVP — single-persona (JARVIS) text chat | ✅ Completed |
 | Phase 2 | Personality System (FRIDAY, ULTRON, switcher) | ✅ Completed |
-| Phase 3 | Memory (vector search, memory dashboard) | ⏳ Planned |
+| Phase 3 | Memory (vector search, memory dashboard) | ✅ Completed |
 | Phase 4 | Voice (STT/TTS, wake word) | ⏳ Planned |
 | Phase 5 | Tools & RAG (web search, documents) | ⏳ Planned |
 | Phase 6 | Multi-Agent System | ⏳ Planned |
@@ -382,8 +428,9 @@ Only technologies actually present in the codebase or `requirements.txt`/`packag
 - The full Phase 2 personality system is complete and verified: three personas (JARVIS/FRIDAY/ULTRON) with a per-message, mid-conversation switcher; ULTRON's deterministic output filter; the backend test suite passes (49/49); a live golden-set run against the real Gemini/Groq APIs confirmed distinct tone per persona, zero over-refusal on ULTRON, and correct handling of prompt-injection/jailbreak attempts; and a live browser walkthrough confirmed persona switching and persistence end-to-end.
 - The database schema is applied (`alembic upgrade head` run against the live database) and the Phase 1 dev user is seeded. No new migration was needed for Phase 2.
 - A CORS bug and a stale-LLM-model-ID issue from Phase 1, plus a persona-blind history replay bug and a stale-`updated_at` bug found while building Phase 2, were all only visible under live conditions and are documented with their fixes in [Section 5](#5-development-phases).
+- Long-term memory (Phase 3) is complete and verified: a real `pgvector` column and HNSW index on Supabase; hybrid capture (explicit "remember that…" detection plus background LLM extraction) that adds no user-visible latency; retrieval wired into every chat reply with a live-tuned similarity threshold; a `/memory` dashboard for viewing, editing, and deleting what's stored; and "recalled" chips on chat replies that survive a reload. The backend test suite passes (102/102), a golden-set script tuned both similarity thresholds against real Gemini embeddings, and a live end-to-end walkthrough (real Supabase writes, real recall in a real chat reply, real background capture) is documented in [Section 5](#5-development-phases).
 
-Phases 3 through 8 have not been started; their objectives above are drawn directly from `docs/architecture.md`.
+Phases 4 through 8 have not been started; their objectives above are drawn directly from `docs/architecture.md`.
 
 ---
 
@@ -418,19 +465,22 @@ Phases 3 through 8 have not been started; their objectives above are drawn direc
 
 ## 8. Project Architecture
 
-The diagram below reflects what's actually implemented today (Phase 1 + Phase 2). The fuller target architecture — Orchestrator, Agent System, Memory System, and Tools/Execution layers — is documented in `docs/architecture.md` (Section 2) and will be built out in later phases; today the chat API endpoint fills the orchestrator's role directly, and the Personality System is a persona registry (`app/personas/`) selected per message, not yet a separate architectural layer.
+The diagram below reflects what's actually implemented today (Phases 1–3). The fuller target architecture — a separate Orchestrator, Agent System, and Tools/Execution layers — is documented in `docs/architecture.md` (Section 2) and will be built out in later phases; today the chat API endpoint fills the orchestrator's role directly, the Personality System is a persona registry (`app/personas/`) selected per message, and the Memory System is `app/memory/` (embedder, vector store, hybrid capture) called directly from the chat endpoint rather than a separate service.
 
 ```mermaid
 flowchart LR
     User -->|types a message| Frontend[Next.js Chat UI]
     Frontend -->|POST /chat/message| Backend[FastAPI Backend]
-    Backend -->|SQLAlchemy async / asyncpg| DB[(PostgreSQL — Supabase)]
+    Backend -->|SQLAlchemy async / asyncpg| DB[(PostgreSQL + pgvector — Supabase)]
+    Backend -->|embed + recall| Memory[Memory System — app/memory/]
+    Memory -->|cosine similarity search| DB
     Backend -->|primary| Gemini[Google Gemini 3.6 Flash]
     Backend -.->|fallback on error| Groq[Groq openai/gpt-oss-120b]
+    Backend -.->|background: capture facts| Memory
     Backend -->|JSON reply| Frontend
 ```
 
-**Request flow:** the user sends a message with a persona id → the frontend calls `POST /chat/message` → the backend resolves or creates a conversation, persists the user's message, looks up the requested (or conversation's current) persona in the registry, builds that persona's system prompt plus recent history (labelling any prior turns from a different persona), and calls the LLM router → the router calls Gemini, retrying with Groq only if Gemini errors → for ULTRON, the reply is screened by a deterministic output filter before being persisted and returned, with `fell_back`/`filtered` flags the UI uses to show a notice.
+**Request flow:** the user sends a message with a persona id → the frontend calls `POST /chat/message` → the backend resolves or creates a conversation, persists the user's message, embeds it and searches `memories` for similar stored facts, looks up the requested (or conversation's current) persona in the registry, builds that persona's system prompt plus recent history and any recalled memories (labelling any prior turns from a different persona), and calls the LLM router → the router calls Gemini, retrying with Groq only if Gemini errors → for ULTRON, the reply is screened by a deterministic output filter before being persisted (along with a snapshot of what was recalled) and returned, with `fell_back`/`filtered` flags the UI uses to show a notice → after the response is sent, a background task detects explicit "remember that…" requests and runs an LLM extraction pass over the message to capture any new durable facts.
 
 ---
 
@@ -448,11 +498,15 @@ flowchart LR
 - [x] JARVIS, FRIDAY, and ULTRON persona registry with per-message, mid-conversation switching
 - [x] ULTRON deterministic output filter (application-layer safety, per `docs/architecture.md` Section 3)
 - [x] Persona switcher UI, per-message persona labels, and a live golden-set evaluation script
-- [x] Backend automated test suite (49 tests, in-memory database, no live credentials needed)
+- [x] Long-term memory with real `pgvector` similarity search, an HNSW index, and per-user scoping
+- [x] Hybrid memory capture — deterministic "remember that…" detection plus background LLM fact extraction, adding no user-visible latency
+- [x] Memory recall wired into every chat reply, framed per persona, with a live-tuned similarity threshold
+- [x] `/memory` dashboard — view, edit, delete individual memories, and a confirmed "Forget everything"
+- [x] "Recalled" chips on chat replies that persist across a reload
+- [x] Backend automated test suite (102 tests, in-memory database, no live credentials needed)
 
 ### Planned
 - [ ] Real user authentication via Supabase Auth
-- [ ] Long-term memory with vector search and a memory dashboard (Phase 3)
 - [ ] Voice input/output per persona (Phase 4)
 - [ ] Web search tool and document RAG with citations (Phase 5)
 - [ ] Multi-agent orchestration (Phase 6)
@@ -535,7 +589,7 @@ All variables are read from a single repo-root `.env` file (see `.env.example` f
 | `DATABASE_URL` | Postgres connection string used at request time (Supavisor transaction-mode pooler recommended) | **Yes** |
 | `MIGRATION_DATABASE_URL` | Non-pooled Postgres connection used by Alembic for schema changes | No — falls back to `DATABASE_URL` |
 | `DEV_USER_ID` | Fixed UUID every request is attributed to while real auth doesn't exist yet | No — has a built-in default |
-| `GEMINI_API_KEY` | Google Gemini API key (primary LLM) | **Yes** |
+| `GEMINI_API_KEY` | Google Gemini API key (primary LLM, and embeddings for long-term memory) | **Yes** |
 | `GROQ_API_KEY` | Groq API key (fallback LLM) | **Yes** |
 | `SEARCH_API_KEY` | Web search provider key | No — reserved for Phase 5 |
 | `PICOVOICE_ACCESS_KEY` | Wake-word detection key | No — reserved for Phase 4 |
@@ -549,12 +603,11 @@ No API keys, passwords, tokens, or other credentials are included in this docume
 ## 12. Future Roadmap
 
 ### Short-Term
-- Commit and tag the Phase 2 milestone.
-- Begin Phase 3 — long-term memory with `pgvector` and a memory management dashboard.
+- Commit and tag the Phase 3 milestone.
+- Begin Phase 4 — voice input/output, wake-word detection, per-persona voices.
 
 ### Medium-Term
-- Phase 4 — voice input/output, wake-word detection, per-persona voices.
-- Real user authentication via Supabase Auth, replacing the single seeded dev user.
+- Real user authentication via Supabase Auth, replacing the single seeded dev user — memory is already scoped by `user_id` throughout, so this is expected to be a drop-in change to `get_current_user_id`.
 
 ### Long-Term
 - Phase 5 — web search tool and document-grounded RAG with citations.
