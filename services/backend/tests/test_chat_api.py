@@ -2,83 +2,18 @@
 
 Uses an in-memory SQLite DB (see app/models/db.py for why the ORM types are
 dialect-portable) and a fake LLM provider, so this needs no network or real
-Postgres/Gemini/Groq access.
+Postgres/Gemini/Groq access. The `provider`/`client` fixtures and the
+`RecordingProvider` fake live in tests/conftest.py, shared with the Phase 3
+memory tests.
 """
 from uuid import uuid4
 
-import pytest
 from httpx import ASGITransport, AsyncClient
-from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
-from sqlalchemy.pool import StaticPool
 
 from app.api.deps import get_current_user_id
-from app.core.database import Base, get_session
-from app.llm.base import LLMMessage, LLMProvider, LLMResponse
-from app.llm.router import LLMRouter, get_llm_router
+from app.core.database import get_session
 from app.main import app
-from app.models.db import User
 from app.personas import Persona, system_prompt_for
-
-
-class RecordingProvider(LLMProvider):
-    """Fake provider that remembers what it was asked.
-
-    The old fake discarded `messages` entirely, so nothing could assert which
-    system prompt the endpoint actually built -- exactly what the persona
-    tests below need to verify.
-    """
-
-    name = "fake-primary"
-
-    def __init__(self, reply: str = "Acknowledged.") -> None:
-        self.reply = reply
-        self.calls: list[list[LLMMessage]] = []
-
-    @property
-    def last_messages(self) -> list[LLMMessage]:
-        return self.calls[-1]
-
-    async def agenerate(self, messages: list[LLMMessage]) -> LLMResponse:
-        self.calls.append(messages)
-        return LLMResponse(content=self.reply, model="fake-model", provider=self.name)
-
-
-@pytest.fixture
-def provider():
-    return RecordingProvider()
-
-
-@pytest.fixture
-async def client(provider):
-    engine = create_async_engine(
-        "sqlite+aiosqlite:///:memory:",
-        poolclass=StaticPool,
-        connect_args={"check_same_thread": False},
-    )
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-
-    session_factory = async_sessionmaker(engine, expire_on_commit=False)
-    user_id = uuid4()
-
-    async with session_factory() as session:
-        session.add(User(id=user_id, email="test@example.com", name="Test User", preferences={}))
-        await session.commit()
-
-    async def override_get_session():
-        async with session_factory() as session:
-            yield session
-
-    app.dependency_overrides[get_session] = override_get_session
-    app.dependency_overrides[get_current_user_id] = lambda: user_id
-    app.dependency_overrides[get_llm_router] = lambda: LLMRouter(primary=provider, fallback=provider)
-
-    transport = ASGITransport(app=app)
-    async with AsyncClient(transport=transport, base_url="http://test") as ac:
-        yield ac
-
-    app.dependency_overrides.clear()
-    await engine.dispose()
 
 
 async def test_send_message_creates_conversation_and_replies(client):
