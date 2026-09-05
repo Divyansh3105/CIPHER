@@ -1,5 +1,6 @@
 import type { ChatMessage } from "@/lib/api";
 import { type Persona, type PersonaInfo, personaLabel } from "@/lib/personas";
+import RecalledMemoryChips from "@/components/RecalledMemoryChips";
 
 // Tailwind's scanner needs literal class strings, not a template literal --
 // see the --color-persona-* tokens in globals.css.
@@ -37,6 +38,7 @@ export default function ChatMessageBubble({
           </div>
         )}
         {message.content}
+        {!isUser && <RecalledMemoryChips memories={message.recalled_memories} />}
       </div>
     </div>
   );

@@ -1,5 +1,6 @@
 "use client";
 
+import Link from "next/link";
 import { useCallback, useEffect, useState } from "react";
 import ConversationSidebar from "@/components/ConversationSidebar";
 import MessageList from "@/components/MessageList";
@@ -87,6 +88,7 @@ export default function Home() {
       content,
       persona,
       created_at: new Date().toISOString(),
+      recalled_memories: [],
     };
     setMessages((prev) => [...prev, optimisticUserMessage]);
     setPending(true);
@@ -126,7 +128,15 @@ export default function Home() {
           <h1 className="text-sm font-semibold tracking-wide text-zinc-900 dark:text-zinc-100">
             CIPHER — {activeLabel}
           </h1>
-          <PersonaSwitcher personas={personas} value={persona} onChange={setPersona} disabled={pending} />
+          <div className="flex items-center gap-3">
+            <PersonaSwitcher personas={personas} value={persona} onChange={setPersona} disabled={pending} />
+            <Link
+              href="/memory"
+              className="text-xs font-semibold uppercase tracking-wide text-zinc-500 hover:text-zinc-900 dark:text-zinc-400 dark:hover:text-zinc-100"
+            >
+              Memory
+            </Link>
+          </div>
         </header>
 
         {notice && (
