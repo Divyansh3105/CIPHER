@@ -363,13 +363,29 @@ Only technologies actually present in the codebase or `requirements.txt`/`packag
 - `scripts/verify_models.py` — proves every registry entry with a real generate call against the project's own keys
 - `apps/web/src/components/ModelChip.tsx` — the active model shown in the header, plus a spoken command path ("switch to Qwen", "change to FRIDAY", "go back to your normal brain") routing persona names to the persona switcher and model names to the registry
 
+*Preflight harness (`scripts/preflight.py`):*
+- 23 live checks against a **running** system, printing a tick or a cross per chain and exiting non-zero on any failure: server up, served routes match this checkout, Alembic at head, dev user seeded, `.env` untracked and not web-reachable, a real Gemini call, a real embedding round trip, a memory written and recalled by the very next chat question, the graph returning no dangling links, an unknown model refused, a model pinned. It cleans up everything it writes
+- The rule that comes with it: **"done" means preflight passed, not that the code looks right.** It caught two real faults within minutes of existing (Challenges 6 and 7 below)
+
+*Keyless wake word:*
+- `matchWakePhrase` matches "hey cipher" at the **start** of an utterance in the transcript the recogniser is already streaming, strips it, and opens a 20-second follow-up window so a conversation does not require repeating the name every turn
+- Anchored to the start deliberately: this assistant is called CIPHER and says its own name often, so "I renamed the cipher module" and "ciphertext is the output" must stay sentences
+- No Picovoice account, no key, no new dependency. The cost is written into the code honestly: unlike a real wake-word engine the recogniser is listening the whole time, which is why hands-free is opt-in per session and never persisted
+
+*3D memory galaxy:*
+- `GET /memory/graph` builds a KNN similarity graph inside Postgres (`app/memory/store.py`), capped at 400 nodes, with mutual pairs collapsed to a single link and every edge endpoint guaranteed present in the node list
+- `MemoryGalaxy.tsx` renders it with `react-force-graph-3d`; nodes are sized by degree and coloured by memory type, clicking one opens an inspector, and the **Recalled chips in chat now deep-link to the exact node that answered**, flying the camera to it
+- Memories with no embedding appear as isolated grey nodes rather than being dropped, so the graph and the dashboard cannot disagree about how much the assistant remembers
+
 *Testing performed:*
 - 55 new backend tests (alias resolution, near-miss refusal, reset phrases, registry integrity, the pin's no-fallback rule, the `/models` endpoints, and a 409 when a pinned model fails) — full suite **157/157 passing**, still with no live credentials needed
 - 16 logic checks on the transcript buffer and the speakable-text normaliser, compiled from the shipped source and run in Node
 - The two spoken-command regexes extracted from the shipped page component and verified against a case table, after two escaping bugs were found in them
 - A live browser integration run driving the real app with a scripted recogniser: two fragments 400ms apart merged into one message; a real Gemini reply spoken with markdown stripped at the JARVIS profile's rate; the mic aborted during playback and restarted after; a bare "stop" cancelling speech without being sent; the mic switch flushing a half-finished thought
 - A live model-swap run: the chip moved from Auto to Qwen, a real chat message actually answered on `qwen/qwen3.8-27b` with `fell_back: false`, and `"switch to gemini 4 flash"` returned 404 naming all seven real models without disturbing the existing pin
-- Frontend typechecks and lints clean
+- 26 further backend tests for the graph and the harness (graph invariants: no dangling links, mutual pairs collapsed once, unembedded memories present but isolated, user scoping, parameter validation; plus four that pin the preflight stale-server detector against deliberately stale specs) — full suite **183/183**
+- 15 wake-phrase cases compiled from the shipped source and run in Node, negatives included
+- 23/23 preflight checks green against the live system; `next build` clean
 
 **Challenges Faced:**
 1. The Web Speech API finalises a phrase on every pause, including pauses in the middle of a sentence.
@@ -377,6 +393,10 @@ Only technologies actually present in the codebase or `requirements.txt`/`packag
 3. A provider's model list is not evidence that a model can actually be called.
 4. Speech arriving while a reply was still in flight was being dropped silently.
 5. The mic button lit up during ordinary typed conversations.
+6. `/memory/graph` returned 503 against real Postgres while all 183 unit tests passed.
+7. A stale server served old code three separate times in one session.
+8. The memory graph was specified around a similarity threshold that turns out not to exist.
+9. Two behaviours of the 3D graph library fail silently rather than erroring.
 
 **How the Challenges Were Overcome:**
 
@@ -400,13 +420,25 @@ Only technologies actually present in the codebase or `requirements.txt`/`packag
 **Solution:** Its on/off state was being derived from the voice state machine, and "thinking"/"speaking" occur when typing too. It now takes the mic switch as an explicit prop.
 **Result:** Verified: typing a message leaves the button reading "Turn the microphone on" with `aria-pressed="false"`.
 
-**What Remains:**
-- **`preflight.py`** — a live-chain harness making real calls against a running system and exiting non-zero on any failure (backend up, Alembic at head, a real Gemini call, a real embedding round trip, chat returning `recalled_memories`, a memory retrievable by the very next question, every registry model reachable, `.env` not reachable from the browser). Every failure that has cost this project time was live-only and invisible to the unit tests — see Phase 1's model-ID and pooler issues and Phase 3's Challenge 4.
-- **3D memory galaxy** — the `memories` table as a force-directed graph, with the camera flying to the memory a reply actually used. Needs `GET /memory/graph` plus a graph view on the existing `/memory` page. The recalled-memory snapshot that already backs the text chips is the data source.
-- **Wake word** — optional and last. No paid key needed: matching "hey cipher" in the transcript stream needs no new dependency, and openWakeWord (MIT) runs locally with no account.
-- **A decision to revisit:** whether to move STT/TTS off the browser. Groq serves `whisper-large-v3` on the `GROQ_API_KEY` this project already has, which is hosted Whisper with no local model download and no new credential.
+**Challenge 6 — green tests, broken endpoint.**
+**Solution:** The adaptive floor binds a nullable float that appears only inside `CASE WHEN :override IS NULL ... ELSE :override`, which gives Postgres nothing to infer a type from, so it answered `AmbiguousParameterError: could not determine data type of parameter $3`. Fixed with explicit `CAST(... AS double precision)`. The reason it was invisible to the suite: the SQLite test fake reimplements the KNN logic in Python and never executes that SQL.
+**Result:** Found by `scripts/preflight.py` on its first live run, minutes after the harness existed. A `/memory/graph` check was added to preflight so the same class of fault cannot return unnoticed.
 
-**Phase Status:** 🚧 In progress — the voice loop and the runtime model swap are built and verified live; the preflight harness, the memory galaxy, and the wake word are outstanding.
+**Challenge 7 — stale servers, three times in one session.**
+**Solution:** Preflight's first real check fetches the running server's `/openapi.json` and diffs it against `app.openapi()` from this checkout — paths in both directions, plus every response schema's property set. Deliberately generic rather than looking for one known-missing field.
+**Result:** All three staleness shapes are caught (a route missing, a response schema a revision behind, a route the checkout does not have). Four tests pin it, and they exist because the first version of the check walked `app.routes` — which in this FastAPI version holds `_IncludedRouter` objects rather than flattened child routes, so it compared exactly one path and passed happily against a genuinely stale server.
+
+**Challenge 8 — the similarity threshold does not exist.**
+**Solution:** `scripts/memory_graph_calibrate.py --corpus` measured real gemini-embedding-001 output over the labelled 8-memory corpus. Every pair scored between 0.641 and 0.809, and unrelated facts ("allergic to peanuts" / "learning guitar", 0.768) outscored what a reader would call related. An absolute floor of 0.75 draws the one true link and six false ones; 0.80 draws only the true link, but purely because 0.809 is the single highest value in that corpus — which is fitting a constant to one data point, not choosing a threshold. Embedding models place short first-person sentences in a narrow cone, so what survives the compression is rank, not distance.
+**Result:** The graph is built from KNN with a floor derived from each store's own mean and spread, and the UI says "nearest by similarity" rather than "related", because that is the only claim the data supports. On the live store the derived floor came out at 0.759.
+
+**Challenge 9 — library behaviours that fail silently.**
+**Solution:** `onEngineStop` never fires in this version, leaving both the deep-link camera flight and the initial framing as dead code hanging off it — found by instrumenting the handler and watching it stay silent while the graph rendered perfectly well; replaced with an explicit settle timer. Separately, rendering depended on `ResizeObserver`, which exists but never fires in some environments, leaving an empty black box and no error anywhere; sizing now measures the element directly in a callback ref and uses the observer only for later resizes.
+**Result:** Deep-linked focus, framing and rendering all verified live. A third quirk — `nodeColor` given as a closure is never re-read, because the library builds each sphere's material once — was handled by dropping the dim-on-select highlight rather than working around it: the library only honours per-node recolouring through in-place mutation of node objects, which React 19's immutability rule forbids on memo-derived data, and losing sight of the whole map to look at one node is worse anyway.
+
+**Known and unexplained:** four memories present in the live store at the start of the session were gone an hour later. The test suite was ruled out (it resolves to a throwaway localhost database, verified directly) and no deletion path was identified. Recorded rather than guessed at; preflight now round-trips a real write and read on every run, which would surface a recurrence.
+
+**Phase Status:** ✅ Completed — voice loop, runtime model swap, preflight harness, keyless wake word, and 3D memory galaxy are all built and verified live. 183/183 backend tests, 23/23 preflight checks, clean production build.
 
 ---
 
@@ -474,8 +506,8 @@ Only technologies actually present in the codebase or `requirements.txt`/`packag
 | Phase 1 | Core MVP — single-persona (JARVIS) text chat | ✅ Completed |
 | Phase 2 | Personality System (FRIDAY, ULTRON, switcher) | ✅ Completed |
 | Phase 3 | Memory (vector search, memory dashboard) | ✅ Completed |
-| Phase 4 | Voice (STT/TTS, wake word) + runtime model swap | 🚧 In progress |
-| Phase 5 | Tools & RAG (web search, documents) | ⏳ Planned |
+| Phase 4 | Voice, runtime model swap, preflight, memory galaxy | ✅ Completed |
+| Phase 5 | Tools & RAG (web search, documents) | ⏳ Planned (next) |
 | Phase 6 | Multi-Agent System | ⏳ Planned |
 | Phase 7 | Advanced Features (vision, computer control) | ⏳ Planned |
 | Phase 8 | Production & Deployment | ⏳ Planned |
@@ -487,8 +519,10 @@ Only technologies actually present in the codebase or `requirements.txt`/`packag
 - A CORS bug and a stale-LLM-model-ID issue from Phase 1, plus a persona-blind history replay bug and a stale-`updated_at` bug found while building Phase 2, were all only visible under live conditions and are documented with their fixes in [Section 5](#5-development-phases).
 - Long-term memory (Phase 3) is complete and verified: a real `pgvector` column and HNSW index on Supabase; hybrid capture (explicit "remember that…" detection plus background LLM extraction) that adds no user-visible latency; retrieval wired into every chat reply with a live-tuned similarity threshold; a `/memory` dashboard for viewing, editing, and deleting what's stored; and "recalled" chips on chat replies that survive a reload. The backend test suite passes (102/102), a golden-set script tuned both similarity thresholds against real Gemini embeddings, and a live end-to-end walkthrough (real Supabase writes, real recall in a real chat reply, real background capture) is documented in [Section 5](#5-development-phases).
 
-- Phase 4 is **in progress**. Two of its slices are built and verified live: a browser-native voice loop (click the mic, talk, hear the reply in the active persona’s voice) and a runtime model swap (pin any of seven verified models mid-conversation, from a header chip or by saying “switch to Qwen”). The backend suite is at 157/157. Still outstanding in this phase: a `preflight.py` live-chain harness, the 3D memory galaxy, and wake-word detection — see [Section 5](#5-development-phases), “What Remains”.
+- Phase 4 is **complete**. Five slices, all verified live: a browser-native voice loop (click the mic, talk, hear the reply in the active persona’s voice) and a runtime model swap (pin any of seven verified models mid-conversation, from a header chip or by saying “switch to Qwen”). — plus a 23-check `preflight.py` live-chain harness, a keyless wake word (“hey CIPHER”, no Picovoice account), and a 3D memory galaxy whose Recalled chips deep-link to the exact memory that answered. 183/183 backend tests, 23/23 preflight checks, clean production build.
 - Two decisions worth knowing about, both documented in `docs/architecture.md`: the voice loop ships on the **browser Web Speech API** rather than the blueprint’s Whisper + Edge-TTS (free and instant, but Chrome/Edge-only and audio goes to Google — contained in one module so the local path stays open), and a **pinned model deliberately never falls back**, because the reason to name a model is knowing which one answered.
+
+- The habit worth carrying forward: **run `python -m scripts.preflight` before calling anything done.** It caught a 503 on a live endpoint while all 183 unit tests were green, because the SQLite test fake reimplements that query in Python and never runs the SQL.
 
 Phases 5 through 8 have not been started; their objectives above are drawn directly from `docs/architecture.md`.
 
@@ -566,13 +600,15 @@ flowchart LR
 - [x] Voice input and output in the browser — mic button, pause-tolerant transcription (`FINISH_MS`), spoken replies in each persona’s voice, echo suppression while speaking, and “stop” as a spoken interrupt
 - [x] Runtime model swap — pin any of seven live-verified models mid-conversation from a header chip or by voice, with unknown names refused rather than resolved to the nearest match, and no silent fallback while pinned
 - [x] `scripts/verify_models.py` — proves every offered model answers a real call, which caught two that the provider’s own model list advertises but 404s on
-- [x] Backend automated test suite (157 tests, in-memory database, no live credentials needed)
+- [x] Keyless wake word — “hey CIPHER” matched in the live transcript, with a follow-up window so a conversation does not need the name every turn; no Picovoice account or key
+- [x] 3D memory galaxy — the memory store as a force-directed graph, with the Recalled chips in chat deep-linking to the exact node that answered
+- [x] `scripts/preflight.py` — 23 live end-to-end checks against a running system, non-zero exit on any failure
+- [x] `scripts/memory_graph_calibrate.py` — measures real embedding similarity so the graph's settings are derived rather than guessed
+- [x] Backend automated test suite (183 tests, in-memory database, no live credentials needed)
 
 ### Planned
 - [ ] Real user authentication via Supabase Auth
-- [ ] `preflight.py` — live end-to-end chain checks against a running system (Phase 4)
-- [ ] 3D memory galaxy — the memory store as a force-directed graph, with the camera flying to the memory a reply used (Phase 4)
-- [ ] Wake-word detection (Phase 4, optional — no paid key required)
+- [ ] Speech-to-text off the browser (Groq `whisper-large-v3`, or local Whisper), if the Chrome-only constraint starts to bite
 - [ ] Web search tool and document RAG with citations (Phase 5)
 - [ ] Multi-agent orchestration (Phase 6)
 - [ ] Vision and permissioned computer control (Phase 7)
@@ -668,11 +704,9 @@ No API keys, passwords, tokens, or other credentials are included in this docume
 ## 12. Future Roadmap
 
 ### Short-Term
-- Finish Phase 4. The voice loop and the runtime model swap are done; what remains is:
-  1. `preflight.py` — a live-chain harness that makes real calls against a running system and exits non-zero on any failure. This is the highest-value item on the list: every bug that has actually cost this project time was live-only and invisible to the unit suite.
-  2. The 3D memory galaxy — render the `memories` table as a force-directed graph and fly the camera to the memory a reply actually used.
-  3. Wake-word detection — optional, no paid key required.
-- Decide whether to move STT/TTS off the browser. Groq serves `whisper-large-v3` on the existing `GROQ_API_KEY`, which is hosted Whisper with no local model download and no new credential.
+- Begin Phase 5 — a web search tool and document-grounded RAG with citations.
+- Grow `scripts/preflight.py` by one check per real incident. It is already the fastest way to tell whether the system actually works, and every check in it was earned by something that broke.
+- Decide whether to move STT/TTS off the browser. Groq serves `whisper-large-v3` on the existing `GROQ_API_KEY` — hosted Whisper with no local model download and no new credential, and the only thing keeping voice Chrome-only.
 
 ### Medium-Term
 - Real user authentication via Supabase Auth, replacing the single seeded dev user — memory is already scoped by `user_id` throughout, so this is expected to be a drop-in change to `get_current_user_id`.
