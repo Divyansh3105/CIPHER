@@ -20,18 +20,19 @@ class GroqProvider(LLMProvider):
         self._client = AsyncGroq(api_key=api_key)
         self._model = model
 
-    async def agenerate(self, messages: list[LLMMessage]) -> LLMResponse:
+    async def agenerate(self, messages: list[LLMMessage], model: str | None = None) -> LLMResponse:
+        model = model or self._model
         try:
             response = await self._client.chat.completions.create(
-                model=self._model,
+                model=model,
                 messages=[{"role": m.role, "content": m.content} for m in messages],
             )
         except APIError as exc:
-            raise LLMProviderError(f"Groq request failed: {exc}") from exc
+            raise LLMProviderError(f"Groq request failed ({model}): {exc}") from exc
 
         choice = response.choices[0] if response.choices else None
         text = choice.message.content if choice and choice.message else None
         if not text:
-            raise LLMProviderError("Groq returned an empty response")
+            raise LLMProviderError(f"Groq returned an empty response ({model})")
 
-        return LLMResponse(content=text, model=self._model, provider=self.name)
+        return LLMResponse(content=text, model=model, provider=self.name)

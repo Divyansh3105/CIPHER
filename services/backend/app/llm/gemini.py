@@ -21,7 +21,8 @@ class GeminiProvider(LLMProvider):
         self._client = genai.Client(api_key=api_key)
         self._model = model
 
-    async def agenerate(self, messages: list[LLMMessage]) -> LLMResponse:
+    async def agenerate(self, messages: list[LLMMessage], model: str | None = None) -> LLMResponse:
+        model = model or self._model
         system_parts = [m.content for m in messages if m.role == "system"]
         system_instruction = "\n\n".join(system_parts) or None
 
@@ -36,15 +37,15 @@ class GeminiProvider(LLMProvider):
 
         try:
             response = await self._client.aio.models.generate_content(
-                model=self._model,
+                model=model,
                 contents=contents,
                 config=types.GenerateContentConfig(system_instruction=system_instruction),
             )
         except APIError as exc:
-            raise LLMProviderError(f"Gemini request failed: {exc}") from exc
+            raise LLMProviderError(f"Gemini request failed ({model}): {exc}") from exc
 
         text = response.text
         if not text:
-            raise LLMProviderError("Gemini returned an empty response")
+            raise LLMProviderError(f"Gemini returned an empty response ({model})")
 
-        return LLMResponse(content=text, model=self._model, provider=self.name)
+        return LLMResponse(content=text, model=model, provider=self.name)
