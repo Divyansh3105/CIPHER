@@ -503,13 +503,44 @@ Only technologies actually present in the codebase or `requirements.txt`/`packag
 
 **Objective:** Refactor the single orchestrator into specialized agents (e.g. Research, Memory, Coding), with an activity dashboard showing which agent handled a given request.
 
-**What Was Done:** Not yet started.
+**What Was Done:**
 
-**Challenges Faced:** None — not yet started.
+*Orchestration (`app/agents/`):*
+- An `Agent` interface and a single shared `AgentContext` — the blueprint's "one conversation state passed between agents", not per-agent state. With per-agent state there is no single answer to "what did the assistant know when it replied", which is the question the audit trail exists to answer
+- `Orchestrator` — routes to at most one specialist, enforces a per-agent timeout, **retries a timeout once and nothing else**, falls back to a plain reply on any failure, and records every run
+- Three specialists: **research** (owns the Phase 5 tools and their planner), **coding** (drafts under engineering instructions, so a debugging answer is not squeezed through "lead with conclusions, stay brief"), and **memory** (answers questions *about* what is stored, with a far wider search and a much lower threshold than ordinary recall — "what do you know about me" has no topic, so normal retrieval matches almost nothing and the assistant denies remembering things it holds)
+- The Phase 5 tool planner **moved into** the research agent rather than being duplicated. The orchestrator picks an agent; the agent picks a tool. Two levels, one owner each, and still one routing round trip per message
 
-**How the Challenges Were Overcome:** Not applicable.
+*Audit trail and API:*
+- `agent_runs` (migration `0004_agents`) with input, output, status, error and duration, and **no foreign key to `agents`** — an audit trail must outlive the registry row it refers to
+- `GET /agents`, `GET /agents/runs`, `PATCH /agents/{{name}}` to switch a specialist off. Absence from the settings table means enabled, so a newly added agent works without anyone creating a row for it
+- An `/agents` dashboard listing every run — successes, failures, timeouts and decided-not-to-act alike — with timings and expandable output
 
-**Phase Status:** ⏳ Planned
+*Testing performed:*
+- 23 new backend tests covering the three promises Section 5 makes: timeout-and-retry (a slow agent is attempted exactly twice), fallback (a failing agent still yields a reply), and isolation (an agent raising an unexpected exception cannot take the conversation down). Plus routing refusal, disabled agents, and run recording — full suite **247/247**
+- `scripts/preflight.py` gained an agent check that asserts a run was actually *recorded*, because an activity view that silently records nothing looks perfectly healthy while being useless. 33 live checks
+- Verified live across all four routing paths: a document question routed to research and answered with page citations, a code question routed to coding, "what do you know about me" routed to memory and returning 7 stored facts, and small talk correctly using no agent at all
+
+**Challenges Faced:**
+1. The blueprint names LangGraph, and the phase needs a router, a timeout, a retry and a table.
+2. Renaming the response fields to match what they now carry broke ten tests and the preflight harness.
+3. A parameterised route was declared above a literal one — in a file whose own comment warns against exactly that.
+
+**How the Challenges Were Overcome:**
+
+**Challenge 1 — framework or not.**
+**Solution:** Hand-rolled. The whole of what this phase needs is roughly two hundred lines, and a graph framework would have added a large dependency, a second way of expressing control flow, and a layer between the code and what it does — in exchange for nothing this phase asked for.
+**Result:** `app/agents/orchestrator.py` is readable start to finish, and the retry and fallback rules are visible rather than configured.
+
+**Challenge 2 — an honest rename with a wide blast radius.**
+**Solution:** After the orchestrator took over routing, `tool_used` held an *agent* name. Keeping it would have been a small lie every future reader had to untangle, so it became `agent_used`/`activity` across the backend, the frontend and the tests.
+**Result:** Ten tests and one preflight check had to be updated, which is the actual cost of the rename and was worth paying once rather than never. Preflight caught the one that unit tests could not: the RAG check was still reading `tool_used` and reporting a false failure.
+
+**Challenge 3 — the trap already documented twice.**
+**Solution:** `PATCH /agents/{{agent_name}}` was declared above `GET /agents/runs`. It happens to be harmless — different HTTP methods do not collide — but the moment anyone adds `GET /agents/{{agent_name}}`, `/agents/runs` becomes a request to describe an agent called "runs". Reordered, and the comment corrected to say what is actually true rather than repeating a warning that did not apply.
+**Result:** `/memory/all` and `/memory/graph` both hit that trap for real; this file will not be the third.
+
+**Phase Status:** ✅ Completed — orchestrator, three specialists, timeouts and retries, the audit trail, the API and the activity dashboard are all built and verified live. 247/247 backend tests, 33 preflight checks, clean production build.
 
 ---
 
@@ -551,8 +582,8 @@ Only technologies actually present in the codebase or `requirements.txt`/`packag
 | Phase 3 | Memory (vector search, memory dashboard) | ✅ Completed |
 | Phase 4 | Voice, runtime model swap, preflight, memory galaxy | ✅ Completed |
 | Phase 5 | Tools & RAG (web search, documents) | ✅ Completed |
-| Phase 6 | Multi-Agent System | ⏳ Planned (next) |
-| Phase 7 | Advanced Features (vision, computer control) | ⏳ Planned |
+| Phase 6 | Multi-Agent System | ✅ Completed |
+| Phase 7 | Advanced Features (vision, computer control) | ⏳ Planned (next) |
 | Phase 8 | Production & Deployment | ⏳ Planned |
 
 **What's currently working:**
@@ -569,7 +600,9 @@ Only technologies actually present in the codebase or `requirements.txt`/`packag
 
 - Phase 5 is **complete**: documents can be uploaded and asked about with page-numbered citations, and the web can be searched. Tool use is a planner call rather than provider function-calling, so swapping LLM providers stays a config change — see [Section 5](#5-development-phases).
 
-Phases 6 through 8 have not been started; their objectives above are drawn directly from `docs/architecture.md`.
+- Phase 6 is **complete**: an orchestrator routes to research, coding or memory specialists, every run is recorded with its timing and outcome, and `/agents` shows the trail. Built by hand rather than on LangGraph — see [Section 5](#5-development-phases) for why.
+
+Phases 7 and 8 have not been started; their objectives above are drawn directly from `docs/architecture.md`.
 
 ---
 
@@ -653,12 +686,14 @@ flowchart LR
 - [x] Document Q&A with **page-numbered citations** — chunks never span pages, so "page 4" is always true
 - [x] Web search — Tavily when a key is set, a keyless provider when it is not, with the difference reported rather than hidden
 - [x] Provider-agnostic tool planner — refuses unrecognised tool names, skips small talk, and degrades to no tool rather than erroring
-- [x] Backend automated test suite (228 tests, in-memory database, no live credentials needed)
+- [x] Multi-agent orchestration — research, coding and memory specialists behind one router, with per-agent timeouts, a retry on timeout, and a fallback to a plain reply when a specialist fails
+- [x] Agent activity dashboard — every run recorded with input, output, status, error and duration, including the failures
+- [x] Per-agent on/off switch
+- [x] Backend automated test suite (247 tests, in-memory database, no live credentials needed)
 
 ### Planned
 - [ ] Real user authentication via Supabase Auth
 - [ ] Speech-to-text off the browser (Groq `whisper-large-v3`, or local Whisper), if the Chrome-only constraint starts to bite
-- [ ] Multi-agent orchestration (Phase 6)
 - [ ] Vision and permissioned computer control (Phase 7)
 - [ ] Production deployment and CI/CD (Phase 8)
 
@@ -752,7 +787,7 @@ No API keys, passwords, tokens, or other credentials are included in this docume
 ## 12. Future Roadmap
 
 ### Short-Term
-- Begin Phase 6 — multi-agent orchestration (specialised Research/Memory/Coding agents) with an activity dashboard.
+- Begin Phase 7 — vision (screen understanding) and permissioned computer control, with a full audit log and kill switch.
 - Grow `scripts/preflight.py` by one check per real incident. It is already the fastest way to tell whether the system actually works, and every check in it was earned by something that broke.
 - Decide whether to move STT/TTS off the browser. Groq serves `whisper-large-v3` on the existing `GROQ_API_KEY` — hosted Whisper with no local model download and no new credential, and the only thing keeping voice Chrome-only.
 
@@ -760,7 +795,6 @@ No API keys, passwords, tokens, or other credentials are included in this docume
 - Real user authentication via Supabase Auth, replacing the single seeded dev user — memory is already scoped by `user_id` throughout, so this is expected to be a drop-in change to `get_current_user_id`.
 
 ### Long-Term
-- Phase 6 — multi-agent orchestration (specialized Research/Memory/Coding agents) with an activity dashboard.
 - Phase 7 — vision (screen understanding) and permissioned computer/application control, with a full audit-log and kill switch.
 - Phase 8 — production deployment, monitoring, and CI/CD.
 

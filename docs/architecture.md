@@ -198,6 +198,17 @@ Once the MVP works, evolve the single-orchestrator design into specialized agent
 
 **Failure handling:** Each agent call has a timeout + retry; if an agent fails, the orchestrator falls back to a plain LLM response rather than crashing the conversation.
 
+### As built (Phase 6)
+
+Built as specified — orchestrator-as-hub, one shared `AgentContext` rather than per-agent state, timeout and retry on every call, fallback to a plain reply — with four decisions the outline left open:
+
+1. **Agents contribute; the persona composes.** No agent writes the final message; each returns material the orchestrator folds into one persona-voiced reply. This follows directly from Section 3: a persona is a style applied to everything the assistant says. If the coding agent emitted its draft directly, asking ULTRON a code question would silently get a different voice, and the persona would have quietly become a routing decision.
+2. **Retry only on timeout.** Re-running a failed call produces the same error twice and doubles the cost of an outage. A timeout is the one case where a second attempt is plausibly different and the first produced nothing usable.
+3. **Two routing levels, one owner each.** The orchestrator chooses an agent; the research agent chooses a tool. The Phase 5 tool planner moved into that agent rather than being duplicated, so there is still one routing round trip per message and only one place deciding each question.
+4. **Every run is recorded, including the ones that did nothing.** `agent_runs` stores input, output, status, error and duration for successes, failures, timeouts and decided-not-to-act alike. Multi-agent systems fail by having something invisible decide something, leaving only an answer that is quietly worse than it should have been; the table is what turns "why was that ungrounded?" into a lookup.
+
+The `agents` table stores only what a user may change, currently `enabled`. What an agent *does* lives in code: putting prompts or behaviour behind a CRUD endpoint would put executable intent in the database. Absence from that table means enabled, so a newly added agent works without anyone creating a row for it.
+
 ---
 
 ## 6. Memory Architecture
@@ -447,6 +458,11 @@ notifications
   # both ends locally (Section 8). These endpoints only become necessary if
   # the Whisper/Edge-TTS backend path is taken.
 
+/agents                         # built in Phase 6
+  GET    /agents                # registered specialists, and whether each is switched on
+  GET    /agents/runs           # the audit trail: successes, failures, timeouts, timings
+  PATCH  /agents/{name}         # switch a specialist on or off
+
 /documents                      # built in Phase 5
   GET    /documents             # with ingestion status per file
   POST   /documents             # multipart upload; 201 + status "pending"
@@ -621,12 +637,13 @@ ai-assistant/
 **Deliverables:** Assistant can search the web and answer questions from your uploaded PDFs with sources.
 **Difficulty:** Medium
 
-### Phase 6 — Multi-Agent System
+### Phase 6 — Multi-Agent System ✅ Complete
 
 **Goals:** Refactor orchestrator into specialized agents (Research, Memory, Coding).
 **Technologies:** LangGraph (or continue hand-rolled if you prefer full control).
 **Deliverables:** Agent activity dashboard showing which agent handled a request.
 **Difficulty:** Hard
+**As built:** hand-rolled, not LangGraph. The whole of what this phase needs is a router, a timeout, a retry and an audit table -- roughly two hundred lines in `app/agents/orchestrator.py` -- and adding a graph framework to hold them would have meant a large dependency, a second way of expressing control flow, and a layer between the code and the thing it does, in exchange for nothing this phase asked for. `app/agents/` provides an `Agent` interface, a shared `AgentContext`, three specialists (research owns the Phase 5 tools, coding drafts under engineering instructions, memory answers questions *about* what is stored), and an `Orchestrator` that routes, enforces per-agent timeouts, retries a timeout once, falls back to a plain reply on any failure, and records every run to `agent_runs` (migration `0004_agents`). `/agents`, `/agents/runs` and a PATCH toggle, plus the activity dashboard at `/agents`. See Section 5 for the four decisions the outline left open. Verified live across all four routing paths -- document, coding, memory and small talk -- with runs recorded and timed.
 
 ### Phase 7 — Advanced Features
 
