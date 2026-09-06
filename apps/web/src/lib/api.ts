@@ -160,3 +160,47 @@ export function deleteMemory(id: string): Promise<{ deleted: number }> {
 export function deleteAllMemories(): Promise<{ deleted: number }> {
   return request<{ deleted: number }>("/memory/all?confirm=true", { method: "DELETE" });
 }
+
+// --- Phase 4: runtime model swap -------------------------------------
+
+export interface ModelInfo {
+  id: string;
+  provider: string;
+  display_name: string;
+  aliases: string[];
+  note: string;
+}
+
+export interface ActiveModel {
+  // False means default routing (primary with automatic fallback). True
+  // means a model was explicitly named and will NOT silently fall back.
+  pinned: boolean;
+  id: string;
+  provider: string;
+  display_name: string;
+  default_id: string;
+}
+
+export interface ModelsResponse {
+  active: ActiveModel;
+  available: ModelInfo[];
+}
+
+export function listModels(): Promise<ModelsResponse> {
+  return request<ModelsResponse>("/models");
+}
+
+// Takes what the user said or picked, not an id -- resolution and refusal
+// both live on the backend (services/backend/app/llm/registry.py), so there
+// is exactly one place that decides what a model name means. A 404 here is
+// the refusal, and its `detail` lists the models that do exist.
+export function setActiveModel(spoken: string): Promise<ActiveModel> {
+  return request<ActiveModel>("/models/active", {
+    method: "POST",
+    body: JSON.stringify({ spoken }),
+  });
+}
+
+export function clearActiveModel(): Promise<ActiveModel> {
+  return request<ActiveModel>("/models/active", { method: "DELETE" });
+}
