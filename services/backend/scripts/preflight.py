@@ -219,7 +219,19 @@ async def check_llm(report: Report, all_models: bool) -> None:
         try:
             response = await providers[spec.provider].agenerate(probe, model=spec.id)
         except LLMProviderError as exc:
-            report.fail(f"model {spec.id}", str(exc)[:120])
+            message = str(exc)
+            if "429" in message or "RESOURCE_EXHAUSTED" in message or "quota" in message.lower():
+                # A warn, not a fail, and the distinction is the point: the
+                # model exists and works, the free-tier allowance for today
+                # is spent. Nothing is broken, and the router's fallback
+                # covers it -- reporting that as a failure would train
+                # whoever runs this to ignore red output.
+                report.warn(
+                    f"model {spec.id}",
+                    "free-tier quota exhausted for now; the router falls back, so chat still works",
+                )
+            else:
+                report.fail(f"model {spec.id}", message[:120])
         else:
             report.ok(f"model {spec.id}", f"replied {response.content.strip()[:20]!r}")
 
@@ -344,6 +356,120 @@ async def check_memory_graph(client: httpx.AsyncClient, report: Report) -> None:
             report.ok("explicit floor is honoured", f"{len(strict['links'])} links survive at 0.99")
 
 
+async def check_tools_and_rag(client: httpx.AsyncClient, report: Report) -> None:
+    """Phase 5: tools, and the document chain end to end.
+
+    The document round trip is the one worth having. It uploads a real file,
+    waits for background ingestion, asks a question whose answer exists only
+    in that file, and asserts the reply came back with a citation naming it.
+    Every step of that is a separate thing that can silently not work --
+    extraction, chunking, embedding, the pgvector query, the planner
+    choosing the tool, the citation surviving onto the message -- and none
+    of them is exercised by the unit suite, which fakes the embedder and the
+    vector search.
+    """
+    section("Tools and RAG")
+
+    try:
+        tools = (await client.get("/tools")).json()
+    except (httpx.HTTPError, ValueError) as exc:
+        report.fail("GET /tools", f"{type(exc).__name__}: {exc}")
+        return
+
+    names = {t["name"] for t in tools}
+    if {"web_search", "document_search"} <= names:
+        report.ok("GET /tools", ", ".join(sorted(names)))
+    else:
+        report.fail("GET /tools", f"expected web_search and document_search, got {sorted(names)}")
+
+    web = next((t for t in tools if t["name"] == "web_search"), None)
+    if web and web["available"]:
+        report.ok("web search is available")
+    elif web:
+        report.warn("web search is available", web["reason"])
+
+    # --- the document chain -------------------------------------------
+    marker_answer = "Zarquon Fourteen"
+    body = (
+        f"{MARKER} verification document.\n\n"
+        f"The internal project codename for the archival subsystem is {marker_answer}. "
+        "This sentence exists so a retrieval test can prove the answer came from this "
+        "file rather than from the model's own knowledge, because no model has ever "
+        "seen this codename before.\n"
+    ) * 3
+
+    document_id = None
+    try:
+        upload = await client.post(
+            "/documents",
+            files={"file": (f"{MARKER}-check.txt", body.encode("utf-8"), "text/plain")},
+        )
+        if upload.status_code != 201:
+            report.fail("document upload", f"{upload.status_code} {upload.text[:120]}")
+            return
+        document_id = upload.json()["document"]["id"]
+        report.ok("document upload", "queued for ingestion")
+
+        # Ingestion is a background task; wait for it to settle.
+        status, error, chunks = "pending", None, 0
+        for _ in range(45):
+            await asyncio.sleep(2)
+            listing = await client.get("/documents")
+            record = next((d for d in listing.json() if d["id"] == document_id), None)
+            if record is None:
+                break
+            status, error, chunks = record["status"], record["error"], record["chunk_count"]
+            if status != "pending":
+                break
+
+        if status == "ready":
+            report.ok("document ingestion", f"{chunks} passages embedded")
+        else:
+            report.fail("document ingestion", f"status={status} error={error}")
+            return
+
+        answer = await client.post(
+            "/chat/message",
+            json={"content": f"What is the internal project codename for the archival subsystem, according to my uploaded documents?"},
+            timeout=120.0,
+        )
+        if answer.status_code != 200:
+            report.fail("document-grounded answer", f"{answer.status_code} {answer.text[:120]}")
+            return
+
+        payload = answer.json()
+        citations = payload["message"].get("citations", [])
+        cited = [c for c in citations if c.get("kind") == "document"]
+
+        if payload.get("tool_used") == "document_search":
+            report.ok("planner chose document_search", payload.get("tool_summary", ""))
+        else:
+            report.fail(
+                "planner chose document_search",
+                f"tool_used={payload.get('tool_used')!r} -- the question was explicitly about uploaded documents",
+            )
+
+        if cited:
+            report.ok("reply carries a document citation", cited[0].get("filename", ""))
+        else:
+            report.fail(
+                "reply carries a document citation",
+                "the answer was not grounded in any passage, so nothing can be traced back to a source",
+            )
+
+        if marker_answer.lower() in payload["message"]["content"].lower():
+            report.ok("the answer came from the document", f"found {marker_answer!r}")
+        else:
+            report.fail(
+                "the answer came from the document",
+                f"{marker_answer!r} is in the uploaded file and not in the reply -- retrieval reached "
+                f"the prompt but the model did not use it, or retrieval missed",
+            )
+    finally:
+        if document_id:
+            await client.delete(f"/documents/{document_id}")
+
+
 async def check_model_swap(client: httpx.AsyncClient, report: Report) -> None:
     section("Runtime model swap")
     try:
@@ -440,8 +566,28 @@ async def cleanup(report: Report) -> None:
                 {"pattern": "%verification codeword%"},
             )
             removed_conversations = result.rowcount or 0
+            # A run that died between upload and delete leaves a document
+            # behind; sweep those too rather than accumulating one per crash.
+            result = await session.execute(
+                text("DELETE FROM documents WHERE filename LIKE :pattern"),
+                {"pattern": f"%{MARKER}%"},
+            )
+            removed_documents = result.rowcount or 0
+            result = await session.execute(
+                text(
+                    "DELETE FROM conversations WHERE id IN ("
+                    "  SELECT conversation_id FROM messages WHERE content ILIKE :pattern"
+                    ")"
+                ),
+                {"pattern": "%archival subsystem%"},
+            )
+            removed_conversations += result.rowcount or 0
             await session.commit()
-        report.ok("test data removed", f"{removed_memories} memories, {removed_conversations} conversations")
+        report.ok(
+            "test data removed",
+            f"{removed_memories} memories, {removed_documents} documents, "
+            f"{removed_conversations} conversations",
+        )
     except Exception as exc:  # noqa: BLE001
         report.warn("test data removed", f"{type(exc).__name__}: {exc} -- check the dashboard for stray rows")
 
@@ -467,6 +613,7 @@ async def main(all_models: bool, skip_llm: bool) -> int:
             await check_embeddings(report)
             await check_chat_and_memory(client, report)
             await check_memory_graph(client, report)
+            await check_tools_and_rag(client, report)
             await check_model_swap(client, report)
             await cleanup(report)
         print(f"\nfinished in {time.monotonic() - started:.1f}s")

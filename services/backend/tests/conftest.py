@@ -18,7 +18,7 @@ os.environ.setdefault("GROQ_API_KEY", "test-groq-key")
 
 import pytest
 from httpx import ASGITransport, AsyncClient
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.orm import undefer
 from sqlalchemy.pool import StaticPool
@@ -45,6 +45,10 @@ from app.memory.store import (
     hash_content,
 )
 from app.models.db import Memory, User
+from app.rag.ingest import get_document_ingestor
+from app.rag.store import ChunkHit, DocumentStore, get_document_store
+from app.tools.base import Tool, ToolResult
+from app.tools.registry import ToolRegistry, get_tool_registry
 
 get_settings.cache_clear()
 
@@ -408,6 +412,146 @@ def memory_writer():
     return RecordingWriter()
 
 
+# --- Fake tools and RAG ---------------------------------------------------
+
+
+class RecordingTool(Tool):
+    """A tool that returns a canned result and remembers being called."""
+
+    def __init__(self, name: str = "fake_tool", result: ToolResult | None = None) -> None:
+        self.name = name
+        self.description = f"Fake tool {name} for tests."
+        self.requires_permission = False
+        self.calls: list[str] = []
+        self._result = result or ToolResult(
+            context="FAKE TOOL CONTEXT", citations=[], summary="ran the fake tool"
+        )
+
+    async def run(self, query: str, **context) -> ToolResult:
+        self.calls.append(query)
+        return self._result
+
+
+@pytest.fixture
+def tool_registry():
+    """Default override: NO tools at all.
+
+    Deliberately empty, for the same reason RecordingWriter is the default
+    memory writer. With real tools registered, every chat test would run the
+    planner -- an extra LLM call that lands in `provider.calls` and corrupts
+    the message assertions ordinary chat and persona tests make, and which
+    would reach the network if the fake ever fell through. Tests that are
+    actually about tools build their own registry.
+    """
+    return ToolRegistry([])
+
+
+class InMemoryDocumentStore(DocumentStore):
+    """Real chunk rows, fake similarity math.
+
+    Mirrors InMemoryVectorStore: everything except the `<=>` operator is
+    real, including user scoping and the "only search ready documents" rule,
+    because those are the parts worth testing.
+    """
+
+    async def add_chunks(self, session, *, document_id, user_id, chunks, embeddings):
+        from app.models.db import DocumentChunk
+
+        for (content, chunk_index, page_number), embedding in zip(chunks, embeddings):
+            session.add(
+                DocumentChunk(
+                    document_id=document_id,
+                    user_id=user_id,
+                    content=content,
+                    chunk_index=chunk_index,
+                    page_number=page_number,
+                    embedding=embedding,
+                )
+            )
+        await session.flush()
+        return len(chunks)
+
+    async def search(
+        self, session, *, user_id, embedding, limit=6, min_similarity=0.55, document_ids=None
+    ):
+        from app.models.db import Document as DocumentModel
+        from app.models.db import DocumentChunk
+
+        query = (
+            select(DocumentChunk, DocumentModel.filename)
+            .join(DocumentModel, DocumentModel.id == DocumentChunk.document_id)
+            .options(undefer(DocumentChunk.embedding))
+            .where(
+                DocumentChunk.user_id == user_id,
+                DocumentChunk.embedding.is_not(None),
+                DocumentModel.status == "ready",
+            )
+        )
+        if document_ids:
+            query = query.where(DocumentChunk.document_id.in_(document_ids))
+
+        rows = (await session.execute(query)).all()
+
+        def _cosine(a, b):
+            dot = sum(x * y for x, y in zip(a, b))
+            na = math.sqrt(sum(x * x for x in a))
+            nb = math.sqrt(sum(x * x for x in b))
+            return 0.0 if na == 0 or nb == 0 else dot / (na * nb)
+
+        hits = []
+        for chunk, filename in rows:
+            similarity = _cosine(embedding, chunk.embedding)
+            if similarity >= min_similarity:
+                hits.append(
+                    ChunkHit(
+                        id=chunk.id,
+                        document_id=chunk.document_id,
+                        filename=filename,
+                        content=chunk.content,
+                        chunk_index=chunk.chunk_index,
+                        page_number=chunk.page_number,
+                        similarity=similarity,
+                    )
+                )
+        hits.sort(key=lambda h: h.similarity, reverse=True)
+        return hits[:limit]
+
+    async def delete_chunks(self, session, *, document_id):
+        from app.models.db import DocumentChunk
+
+        result = await session.execute(
+            delete(DocumentChunk).where(DocumentChunk.document_id == document_id)
+        )
+        return result.rowcount or 0
+
+
+@pytest.fixture
+def document_store():
+    return InMemoryDocumentStore()
+
+
+class RecordingIngestor:
+    """Default override for get_document_ingestor: records, never embeds.
+
+    Same rationale as RecordingWriter -- background ingestion runs to
+    completion before `client.post(...)` returns, so a real ingestor would
+    make live embedding calls during every upload test.
+    """
+
+    def __init__(self) -> None:
+        self.calls: list[dict] = []
+
+    async def ingest(self, *, session_factory, document_id, user_id, filename, data) -> None:
+        self.calls.append(
+            {"document_id": document_id, "user_id": user_id, "filename": filename, "size": len(data)}
+        )
+
+
+@pytest.fixture
+def document_ingestor():
+    return RecordingIngestor()
+
+
 # --- Raw DB session (for store-level unit tests, no HTTP layer) ------------
 
 
@@ -436,7 +580,7 @@ async def db_session():
 
 
 @pytest.fixture
-async def client(provider, embedder, memory_store, memory_writer):
+async def client(provider, embedder, memory_store, memory_writer, tool_registry, document_store, document_ingestor):
     engine = create_async_engine(
         "sqlite+aiosqlite:///:memory:",
         poolclass=StaticPool,
@@ -463,6 +607,9 @@ async def client(provider, embedder, memory_store, memory_writer):
     app.dependency_overrides[get_embedder] = lambda: embedder
     app.dependency_overrides[get_memory_store] = lambda: memory_store
     app.dependency_overrides[get_memory_writer] = lambda: memory_writer
+    app.dependency_overrides[get_tool_registry] = lambda: tool_registry
+    app.dependency_overrides[get_document_store] = lambda: document_store
+    app.dependency_overrides[get_document_ingestor] = lambda: document_ingestor
 
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as ac:
