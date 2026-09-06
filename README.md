@@ -548,13 +548,57 @@ Only technologies actually present in the codebase or `requirements.txt`/`packag
 
 **Objective:** Screen understanding (vision), permissioned computer/application control, and calendar/task integration — every automated action gated behind explicit, session-scoped user approval.
 
-**What Was Done:** Not yet started.
+**Scope note:** vision and permissioned control are built. **Calendar/task integration is deliberately not.** Tasks are a CRUD feature with no relationship to the safety work this phase is about, and adding them would have padded a security-critical phase with something that belongs beside the memory dashboard.
 
-**Challenges Faced:** None — not yet started.
+**What Was Done:**
 
-**How the Challenges Were Overcome:** Not applicable.
+*The permission model (`app/automation/`):*
+- **Three risk tiers** mapping to the blueprint's model: `read_only` (runs with no grant — refusing to let the assistant *look* protects nothing), `session` (a grant that expires), and `sensitive` (**always** needs an individual confirmation, whatever else has been approved)
+- `AutomationGuard.execute` is the **only** way to run an action, and nothing else in the codebase imports `Action.execute`. The blueprint requires the check to happen before execution rather than before display; one entry point is what makes that true by construction rather than by discipline
+- A **kill switch** that halts everything including read-only actions, takes effect immediately, and never asks “are you sure?” — a stop control that needs confirming is not one
+- An **audit log** with no foreign keys and no cascade, recording denials and blocks alongside executions, with secrets redacted
 
-**Phase Status:** ⏳ Planned
+*The action allowlist:*
+- Four actions: `system_info` and `list_directory` (read-only), `open_url` (session), `open_app` (**sensitive**). There is no shell action and no runtime registration path, so “never execute arbitrary shell commands” is structural rather than a filter
+- `open_url` uses a **scheme allowlist**, not a blocklist — a blocklist is a promise to have thought of every scheme anyone will invent, and `file://` and `javascript:` are only the obvious two
+- `list_directory` resolves a path **before** checking containment, so `..` cannot escape the allowlist while appearing to be inside it
+- Empty allowlists mean nothing is readable and nothing is launchable, and the whole system is off unless `AUTOMATION_ENABLED=true`. A fresh clone is inert
+
+*Vision:*
+- The browser owns the capture (`getDisplayMedia`), so the backend cannot screenshot its own host and the user picks exactly what to share with an indicator running throughout
+- **The frame is captured when the question is asked**, never cached; a share that has ended produces “the share ended” rather than an answer about a screen that has since changed
+- Media type is sniffed from the bytes rather than trusted from the upload, and a text-only model **refuses** images rather than answering from the question alone
+
+*Interface:*
+- A `/control` page with STOP first and always reachable, every action's tier shown permanently, and the full attempt log
+- A screen-share control in chat
+
+*Testing performed:*
+- **40 safety tests**, written as assertions about refusal rather than success: that a session grant cannot cover a sensitive action, that a trusted grant cannot either, that `..` cannot escape a directory allowlist, that a near-miss app name is refused rather than matched, that ULTRON gets no extra latitude, that denials are logged, and that secrets are redacted — full suite **292/292**
+- `scripts/preflight.py` gained six safety checks that run against the **deployed** process, because “the allowlist has no shell action” and “this running server has no shell action” are different claims. Verified live with automation temporarily enabled: sensitive actions demanded confirmation, a category approval did **not** cover `open_app`, the kill switch halted even read-only actions, and every refusal reached the log
+
+**Challenges Faced:**
+1. Deciding what a “computer control” feature should actually be able to do.
+2. `AUTOMATION_ENABLED` was documented in `.env` and read from `os.environ`, which never sees it.
+3. Fixing that made the test suite depend on the developer's own `.env`.
+
+**How the Challenges Were Overcome:**
+
+**Challenge 1 — scope, on the one feature where scope is a safety question.**
+**Solution:** Built the permission framework in full and kept the action list deliberately tiny. The framework is the part with lasting value and no risk; a broad action list is the opposite. `open_app` was placed in the sensitive tier specifically so the escalation path has a real inhabitant and stays exercised rather than becoming decoration.
+**Result:** Four actions, none of which can do anything irreversible, behind a model that would hold up if the list grew.
+
+**Challenge 2 — a setting that could never be set.**
+**Solution:** `automation_enabled()` read `os.environ` directly, and uvicorn does not load `.env` into the process environment — so the setting this project documents in `.env.example` was silently ignored. Now read through `Settings` (which loads `.env`) with an `os.environ` override taking precedence, so both a deployment variable and a live change work.
+**Result:** Caught by preflight against a running server after enabling it in `.env` and watching nothing change. No unit test could have found it: the tests set the environment directly, which is exactly the path that worked.
+
+**Challenge 3 — the fix made the tests non-hermetic.**
+**Solution:** With `.env` in the fallback chain, a developer who switches automation on for real would change what the suite tests. `conftest.py` now **assigns** the automation variables (rather than `setdefault`) so every test starts from the safe default and opts in explicitly.
+**Result:** The suite is independent of local configuration again, which is the property that was quietly lost and would have been very confusing to debug later.
+
+**Known limitation:** the kill switch is in-process and in memory. That is deliberate — a stop control that needs a database round trip keeps working through an outage, which is when someone is most likely to reach for it — but with more than one worker it stops only the worker that received the request. Single-worker today; worth revisiting before scaling out.
+
+**Phase Status:** ✅ Completed — vision, the permission model, the action allowlist, the kill switch, the audit log and the control page are all built and verified live. Calendar/task integration deliberately deferred. 292/292 backend tests, clean production build.
 
 ---
 
@@ -583,8 +627,8 @@ Only technologies actually present in the codebase or `requirements.txt`/`packag
 | Phase 4 | Voice, runtime model swap, preflight, memory galaxy | ✅ Completed |
 | Phase 5 | Tools & RAG (web search, documents) | ✅ Completed |
 | Phase 6 | Multi-Agent System | ✅ Completed |
-| Phase 7 | Advanced Features (vision, computer control) | ⏳ Planned (next) |
-| Phase 8 | Production & Deployment | ⏳ Planned |
+| Phase 7 | Advanced Features (vision, permissioned control) | ✅ Completed |
+| Phase 8 | Production & Deployment | ⏳ Planned (next) |
 
 **What's currently working:**
 - The full Phase 1 backend and frontend code is complete and verified: the backend test suite passes, the frontend builds/lints/typechecks cleanly, and it has been exercised live end-to-end — real `uvicorn` + real Next.js dev server, a real message sent through `POST /chat/message`, answered by the real Gemini API, and persisted to and re-read from the live Supabase Postgres database.
@@ -602,7 +646,9 @@ Only technologies actually present in the codebase or `requirements.txt`/`packag
 
 - Phase 6 is **complete**: an orchestrator routes to research, coding or memory specialists, every run is recorded with its timing and outcome, and `/agents` shows the trail. Built by hand rather than on LangGraph — see [Section 5](#5-development-phases) for why.
 
-Phases 7 and 8 have not been started; their objectives above are drawn directly from `docs/architecture.md`.
+- Phase 7 is **complete**: CIPHER can look at a shared screen, and can act on the machine only through a four-action allowlist behind a permission model with a kill switch and an audit log. **Automation is off unless `AUTOMATION_ENABLED=true`** — a fresh clone is inert. Calendar/task integration was deliberately deferred; see [Section 5](#5-development-phases).
+
+Phase 8 has not been started; its objectives above are drawn directly from `docs/architecture.md`.
 
 ---
 
@@ -689,12 +735,15 @@ flowchart LR
 - [x] Multi-agent orchestration — research, coding and memory specialists behind one router, with per-agent timeouts, a retry on timeout, and a fallback to a plain reply when a specialist fails
 - [x] Agent activity dashboard — every run recorded with input, output, status, error and duration, including the failures
 - [x] Per-agent on/off switch
-- [x] Backend automated test suite (247 tests, in-memory database, no live credentials needed)
+- [x] Screen understanding — share a window and ask about it, with the frame captured at the moment of asking rather than cached
+- [x] Permissioned computer control — a four-action allowlist, three risk tiers, session and trusted grants, and no way to run an arbitrary command
+- [x] Kill switch — halts everything immediately, including read-only actions, with no confirmation
+- [x] Audit log — every attempt recorded, denials included, secrets redacted, and no cascade that could erase it
+- [x] Backend automated test suite (292 tests, in-memory database, no live credentials needed)
 
 ### Planned
 - [ ] Real user authentication via Supabase Auth
 - [ ] Speech-to-text off the browser (Groq `whisper-large-v3`, or local Whisper), if the Chrome-only constraint starts to bite
-- [ ] Vision and permissioned computer control (Phase 7)
 - [ ] Production deployment and CI/CD (Phase 8)
 
 ---
@@ -787,7 +836,7 @@ No API keys, passwords, tokens, or other credentials are included in this docume
 ## 12. Future Roadmap
 
 ### Short-Term
-- Begin Phase 7 — vision (screen understanding) and permissioned computer control, with a full audit log and kill switch.
+- Begin Phase 8 — production deployment, monitoring and CI/CD.
 - Grow `scripts/preflight.py` by one check per real incident. It is already the fastest way to tell whether the system actually works, and every check in it was earned by something that broke.
 - Decide whether to move STT/TTS off the browser. Groq serves `whisper-large-v3` on the existing `GROQ_API_KEY` — hosted Whisper with no local model download and no new credential, and the only thing keeping voice Chrome-only.
 
@@ -795,7 +844,6 @@ No API keys, passwords, tokens, or other credentials are included in this docume
 - Real user authentication via Supabase Auth, replacing the single seeded dev user — memory is already scoped by `user_id` throughout, so this is expected to be a drop-in change to `get_current_user_id`.
 
 ### Long-Term
-- Phase 7 — vision (screen understanding) and permissioned computer/application control, with a full audit-log and kill switch.
 - Phase 8 — production deployment, monitoring, and CI/CD.
 
 ---

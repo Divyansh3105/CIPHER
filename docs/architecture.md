@@ -335,6 +335,21 @@ This is the most safety-sensitive part of the project — designed carefully fro
 
 **Sandbox approach for early testing:** Build and test automation features in a sandboxed/limited environment (e.g., a test user account, a VM, or a restricted set of allowed apps) before ever pointing it at your main system.
 
+### As built (Phase 7)
+
+Every element of the permission model above is implemented in `app/automation/`, and the design's sharpest requirement — "session approval never silently covers these" — is enforced by *ordering*: `AutomationGuard.check` tests the sensitive tier before it ever looks for a grant, so no grant can satisfy one. Two tests and one live preflight check exist solely to keep that true.
+
+Four decisions worth recording:
+
+1. **One door.** `AutomationGuard.execute` is the only path to running an action; nothing else in the codebase imports `Action.execute`. Section 14 requires the permission check to happen before execution rather than before display, and a single entry point is the only way to make that true by construction instead of by discipline.
+2. **The allowlist is structural.** There is no shell action, no `run_command`, and no runtime registration path. A model can name an action or fail; it cannot introduce one. A near-miss name is refused rather than matched to the nearest, the same rule as the model registry.
+3. **Off by default.** Nothing runs unless `AUTOMATION_ENABLED=true`, and the sandbox requirement above is met by that plus two more allowlists: `AUTOMATION_ALLOWED_DIRS` (empty means no directory is readable) and `AUTOMATION_ALLOWED_APPS` (empty means no application can be launched). A fresh clone is inert.
+4. **The audit log outlives everything.** `activity_logs` has no foreign keys and no cascade. Deleting a user, a grant or an action definition must not erase the record of what was attempted; retention is a policy decision, never a side effect of another delete. Denials and blocks are recorded alongside executions, because a log of only what ran hides exactly the entries worth reviewing.
+
+**Vision** is browser-side by design. `getDisplayMedia` makes the user pick what to share and shows them a recording indicator; a backend that could screenshot its own host would do neither. The frame is captured at the moment a question is asked, never cached, and a share that has ended produces an explicit "the share ended" rather than an answer about a screen that has since changed.
+
+**Known limitation:** the kill switch is in-process. It is deliberately in memory rather than in the database, because a stop control that needs a round trip keeps working for the duration of an outage — which is when someone is most likely to reach for it. With more than one worker, it stops the worker that received the request. Single-worker today; worth revisiting before scaling out.
+
 ---
 
 ## 10. Tech Stack
@@ -457,6 +472,18 @@ notifications
   # NOT BUILT, and not needed by the shipped voice loop: the browser does
   # both ends locally (Section 8). These endpoints only become necessary if
   # the Whisper/Edge-TTS backend path is taken.
+
+/automation                     # built in Phase 7
+  GET    /automation/actions    # what exists, its risk tier, whether it may run now
+  POST   /automation/permissions        # approve a category (session or trusted)
+  DELETE /automation/permissions/{name} # revoke
+  POST   /automation/execute    # the ONLY executing route; every call passes the guard
+  POST   /automation/stop       # kill switch on, no confirmation
+  POST   /automation/resume     # kill switch off
+  GET    /automation/log        # the audit trail, denials included
+
+/vision                         # built in Phase 7
+  POST   /vision                # one uploaded frame + a question
 
 /agents                         # built in Phase 6
   GET    /agents                # registered specialists, and whether each is switched on
@@ -645,11 +672,13 @@ ai-assistant/
 **Difficulty:** Hard
 **As built:** hand-rolled, not LangGraph. The whole of what this phase needs is a router, a timeout, a retry and an audit table -- roughly two hundred lines in `app/agents/orchestrator.py` -- and adding a graph framework to hold them would have meant a large dependency, a second way of expressing control flow, and a layer between the code and the thing it does, in exchange for nothing this phase asked for. `app/agents/` provides an `Agent` interface, a shared `AgentContext`, three specialists (research owns the Phase 5 tools, coding drafts under engineering instructions, memory answers questions *about* what is stored), and an `Orchestrator` that routes, enforces per-agent timeouts, retries a timeout once, falls back to a plain reply on any failure, and records every run to `agent_runs` (migration `0004_agents`). `/agents`, `/agents/runs` and a PATCH toggle, plus the activity dashboard at `/agents`. See Section 5 for the four decisions the outline left open. Verified live across all four routing paths -- document, coding, memory and small talk -- with runs recorded and timed.
 
-### Phase 7 — Advanced Features
+### Phase 7 — Advanced Features ✅ Complete (vision and control; tasks deferred)
 
 **Goals:** Screen understanding (vision), computer/app control with full permission system, calendar/task integration.
 **Deliverables:** Assistant can (with your explicit session approval) open an app, summarize your screen, or manage a task list.
 **Difficulty:** Hard
+**As built:** vision and permissioned control are built and verified; **calendar/task integration is deliberately not**. Tasks are a CRUD feature with no relationship to the safety work this phase is actually about, and folding them in would have padded a security-critical phase with something that belongs beside the memory dashboard. The `tasks` table stays unbuilt and is noted in Section 12.
+See Section 9 for the four decisions behind the permission implementation and the one known limitation (an in-process kill switch).
 
 ### Phase 8 — Production & Deployment
 
