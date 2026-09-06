@@ -680,7 +680,7 @@ ai-assistant/
 **As built:** vision and permissioned control are built and verified; **calendar/task integration is deliberately not**. Tasks are a CRUD feature with no relationship to the safety work this phase is actually about, and folding them in would have padded a security-critical phase with something that belongs beside the memory dashboard. The `tasks` table stays unbuilt and is noted in Section 12.
 See Section 9 for the four decisions behind the permission implementation and the one known limitation (an in-process kill switch).
 
-### Phase 8 — Production & Deployment
+### Phase 8 — Production & Deployment ✅ Complete (except the deploy itself)
 
 **Goals:** Polish UI, deploy publicly (or to your small tester group), add monitoring, write documentation.
 **Deliverables:** Live, deployed, demoable product with README, demo video, and portfolio write-up.
@@ -749,6 +749,16 @@ Since your time availability is flexible, here's a **relative-effort plan** inst
 - **Docker:** Containerize the FastAPI backend early (even for local dev) — makes the eventual Render/Railway deploy trivial and is a strong resume item.
 - **CI/CD:** GitHub Actions — run tests on every PR, auto-deploy `main` branch to staging/production.
 - **Secrets:** Store all API keys in Vercel/Render's environment variable settings, never commit `.env` files (only `.env.example`).
+
+### As built (Phase 8)
+
+Everything that can be built without credentials is built; the deploy itself is a runbook in `deployment.md` because it needs accounts only the owner has.
+
+- **Container:** multi-stage, non-root (uid 10001), exec-form `CMD` so uvicorn is PID 1 and receives SIGTERM directly rather than being killed after a grace period. Built from the repository root, which is the setting most likely to be got wrong. Verified by running the image against the real database, not just by building it — which is how a hardcoded `parents[4]` in `config.py` was found: it assumed the repository layout and raised `IndexError` at import inside the image, before a line of the app ran. The env file is now located by walking up rather than by a fixed depth.
+- **`.dockerignore` excludes `.env`.** An image layer is readable by anyone who can pull it, and deleting a file in a later layer does not remove it from an earlier one.
+- **Health checks are split.** `/health` is liveness and deliberately checks nothing else — a liveness probe that fails on a brief database blip gets the container restarted, which does not fix the database and does lose what was in flight. `/health/ready` checks the database and returns 503, so a balancer stops routing to a process that would only produce errors.
+- **Rate limiting** is in-memory and per-worker, which is a real limitation and the right trade at this size: Redis is a service to run, pay for and monitor, and the threat here is a retry loop or a runaway agent exhausting a free-tier quota, not an attacker. The window slides rather than resetting, because a fixed bucket lets a caller spend two full allowances either side of a boundary.
+- **CI does not deploy.** Auto-deploying `main` is suggested above and deliberately not done: this repository is committed to directly, so that would make every commit a release. CI also does not run `scripts/preflight.py`, which makes real billable calls with real keys — it is a pre-release step for a human, run against a running system.
 
 ---
 

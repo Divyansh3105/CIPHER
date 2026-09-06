@@ -606,13 +606,45 @@ Only technologies actually present in the codebase or `requirements.txt`/`packag
 
 **Objective:** Polish the UI, deploy publicly (or to a small tester group), add monitoring, and finalize documentation.
 
-**What Was Done:** Not yet started.
+**Scope note:** everything that can be built without credentials is built. **The deploy itself is not done**, because Vercel and Render need accounts only the project owner has. `docs/deployment.md` is the runbook.
 
-**Challenges Faced:** None — not yet started.
+**What Was Done:**
 
-**How the Challenges Were Overcome:** Not applicable.
+*Production hardening:*
+- **Per-user rate limiting** (`app/core/ratelimit.py`) on the two expensive endpoints, checked **before** any work rather than after — a limiter that runs after the LLM call protects nothing. The window slides rather than resetting, because a fixed bucket lets a caller spend two full allowances either side of a boundary. A rejected request is not counted, so retrying does not extend the penalty into a lockout
+- **Split health checks.** `/health` is liveness and checks nothing else; a liveness probe that fails on a brief database blip gets the container restarted, which does not fix the database and does lose what was in flight. `/health/ready` checks the database and returns 503 so a balancer stops routing to it
 
-**Phase Status:** ⏳ Planned
+*Container and CI:*
+- Multi-stage `Dockerfile`, **non-root** (uid 10001), exec-form `CMD` so uvicorn is PID 1 and receives `SIGTERM` directly rather than being killed after a grace period, and a `HEALTHCHECK` on readiness
+- `.dockerignore` keeps `.env` out of the build context entirely — an image layer is readable by anyone who can pull it, and deleting a file in a later layer does not remove it from an earlier one
+- GitHub Actions running backend tests, frontend lint/typecheck/**build**, and an image build, with `cancel-in-progress` so a superseded run does not burn free minutes
+
+*Documentation:*
+- `docs/deployment.md`: the runbook, including the three settings most likely to be wrong (Render's Docker build context must be the repository root, Vercel's root directory must be `apps/web`, and `NEXT_PUBLIC_API_URL` is baked in at build time so changing it in a dashboard alone does nothing)
+- An explicit warning **not to enable automation on a hosted backend**: Phase 7's actions act on the machine the backend runs on, which on a Render container is meaningless at best
+
+*Testing performed:*
+- 7 rate-limiter tests, including that the limiter runs before the LLM is called and that rejections are not counted — full suite **299/299**
+- **The image was run, not just built**: started against the real Supabase database, reported healthy via its own `HEALTHCHECK`, served `/health`, `/health/ready` and `/models` correctly, and confirmed running as uid 10001. That is what found Challenge 1 below
+- CI workflow validated as parseable YAML with all three jobs present
+
+**Challenges Faced:**
+1. The backend crashed on import inside the container, before a single line of the app ran.
+2. The rate limiter is process-wide, which made the test suite order-dependent.
+
+**How the Challenges Were Overcome:**
+
+**Challenge 1 — a hardcoded path depth.**
+**Solution:** `config.py` computed the repository root as `Path(__file__).resolve().parents[4]`, which is correct for `<root>/services/backend/app/core/config.py` and raises `IndexError: 4` at `/app/app/core/config.py` in the image. It now walks up looking for a `.env` and returns `None` when there is none — which is the correct answer in a container, where configuration comes from real environment variables.
+**Result:** Found only by **running** the image. The test suite and the dev server both live in the layout the hardcoded index assumed, so nothing short of starting the container could have caught it — the same lesson preflight teaches, one level further out.
+
+**Challenge 2 — shared state across tests.**
+**Solution:** The limiter is a singleton because a per-request one would count to one and never further. That makes it shared state, so a suite sending more than the per-minute allowance would start failing with 429s in whichever test happened to run twentieth. An autouse fixture clears it between tests.
+**Result:** The third piece of process-wide state in this project (after the kill switch and the model pin) to need exactly this treatment — a pattern worth recognising early rather than debugging three times.
+
+**What remains, and needs you:** the deploy. Create the Vercel and Render projects, set the environment variables, and follow `docs/deployment.md`. Everything up to that point is done and verified.
+
+**Phase Status:** ✅ Completed — rate limiting, health checks, the container, CI and the deployment runbook are all built and verified. The public deploy is the owner's step. 299/299 backend tests, clean production build, image runs healthy against the real database.
 
 ---
 
@@ -628,7 +660,7 @@ Only technologies actually present in the codebase or `requirements.txt`/`packag
 | Phase 5 | Tools & RAG (web search, documents) | ✅ Completed |
 | Phase 6 | Multi-Agent System | ✅ Completed |
 | Phase 7 | Advanced Features (vision, permissioned control) | ✅ Completed |
-| Phase 8 | Production & Deployment | ⏳ Planned (next) |
+| Phase 8 | Production & Deployment | ✅ Completed (deploy is the owner's step) |
 
 **What's currently working:**
 - The full Phase 1 backend and frontend code is complete and verified: the backend test suite passes, the frontend builds/lints/typechecks cleanly, and it has been exercised live end-to-end — real `uvicorn` + real Next.js dev server, a real message sent through `POST /chat/message`, answered by the real Gemini API, and persisted to and re-read from the live Supabase Postgres database.
@@ -648,7 +680,9 @@ Only technologies actually present in the codebase or `requirements.txt`/`packag
 
 - Phase 7 is **complete**: CIPHER can look at a shared screen, and can act on the machine only through a four-action allowlist behind a permission model with a kill switch and an audit log. **Automation is off unless `AUTOMATION_ENABLED=true`** — a fresh clone is inert. Calendar/task integration was deliberately deferred; see [Section 5](#5-development-phases).
 
-Phase 8 has not been started; its objectives above are drawn directly from `docs/architecture.md`.
+- Phase 8 is **complete except the deploy itself**: rate limiting, split health checks, a non-root container verified by running it, CI, and `docs/deployment.md`. Creating the Vercel and Render projects needs accounts only the owner has.
+
+**All eight phases are now built.** What is left is not a phase: deploy it, then let real use decide what gets built next.
 
 ---
 
@@ -739,12 +773,16 @@ flowchart LR
 - [x] Permissioned computer control — a four-action allowlist, three risk tiers, session and trusted grants, and no way to run an arbitrary command
 - [x] Kill switch — halts everything immediately, including read-only actions, with no confirmation
 - [x] Audit log — every attempt recorded, denials included, secrets redacted, and no cascade that could erase it
-- [x] Backend automated test suite (292 tests, in-memory database, no live credentials needed)
+- [x] Per-user rate limiting on the expensive endpoints, checked before any work is done
+- [x] Split liveness and readiness health checks
+- [x] Non-root multi-stage container, verified by running it against the real database
+- [x] GitHub Actions CI — backend tests, frontend lint/typecheck/build, image build
+- [x] Deployment runbook (`docs/deployment.md`)
+- [x] Backend automated test suite (299 tests, in-memory database, no live credentials needed)
 
 ### Planned
 - [ ] Real user authentication via Supabase Auth
 - [ ] Speech-to-text off the browser (Groq `whisper-large-v3`, or local Whisper), if the Chrome-only constraint starts to bite
-- [ ] Production deployment and CI/CD (Phase 8)
 
 ---
 
@@ -836,7 +874,8 @@ No API keys, passwords, tokens, or other credentials are included in this docume
 ## 12. Future Roadmap
 
 ### Short-Term
-- Begin Phase 8 — production deployment, monitoring and CI/CD.
+- **Deploy it.** Follow `docs/deployment.md`: create the Vercel and Render projects, set the environment variables, run `alembic upgrade head`, and send one real message through the deployed frontend.
+- Add real authentication (Supabase Auth), replacing the single seeded dev user. Everything is already scoped by `user_id`, so this stays a change to `get_current_user_id` rather than a migration of anything.
 - Grow `scripts/preflight.py` by one check per real incident. It is already the fastest way to tell whether the system actually works, and every check in it was earned by something that broke.
 - Decide whether to move STT/TTS off the browser. Groq serves `whisper-large-v3` on the existing `GROQ_API_KEY` — hosted Whisper with no local model download and no new credential, and the only thing keeping voice Chrome-only.
 
@@ -844,7 +883,6 @@ No API keys, passwords, tokens, or other credentials are included in this docume
 - Real user authentication via Supabase Auth, replacing the single seeded dev user — memory is already scoped by `user_id` throughout, so this is expected to be a drop-in change to `get_current_user_id`.
 
 ### Long-Term
-- Phase 8 — production deployment, monitoring, and CI/CD.
 
 ---
 
