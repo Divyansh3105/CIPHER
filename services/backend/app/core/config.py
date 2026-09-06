@@ -6,14 +6,34 @@ from uuid import UUID
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-# services/backend/app/core/config.py -> repo root is 4 parents up.
-ROOT_DIR = Path(__file__).resolve().parents[4]
-ENV_FILE = ROOT_DIR / ".env"
+def _find_env_file() -> str | None:
+    """The nearest .env walking up from this file, or None if there is none.
+
+    Was `parents[4]`, which assumed the repository layout
+    (<root>/services/backend/app/core/config.py) and crashed at import inside
+    the container, where the app lives at /app/app/core/config.py and there
+    is no fourth parent -- `IndexError: 4` before a single line of the app
+    ran. Only running the image found it; the test suite and the dev server
+    both live in the layout the hardcoded index assumed.
+
+    Returning None is the correct answer in a container: configuration comes
+    from real environment variables there, and pydantic-settings treats a
+    None env_file as "there is no file", which is exactly true.
+    """
+    here = Path(__file__).resolve()
+    for parent in here.parents:
+        candidate = parent / ".env"
+        if candidate.is_file():
+            return str(candidate)
+    return None
+
+
+ENV_FILE = _find_env_file()
 
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
-        env_file=str(ENV_FILE),
+        env_file=ENV_FILE,
         env_file_encoding="utf-8",
         extra="ignore",
     )

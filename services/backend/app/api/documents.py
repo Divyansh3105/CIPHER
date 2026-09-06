@@ -19,6 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.api.deps import get_current_user_id
 from app.core.database import get_session, get_session_factory
+from app.core.ratelimit import UPLOAD_RULE, RateLimiter, get_rate_limiter
 from app.models.db import Document
 from app.models.schemas import DocumentOut, DocumentUploadResponse
 from app.rag.extract import MAX_UPLOAD_BYTES, SUPPORTED_EXTENSIONS, ExtractionError, extract
@@ -54,7 +55,16 @@ async def upload_document(
     user_id: UUID = Depends(get_current_user_id),
     ingestor: DocumentIngestor = Depends(get_document_ingestor),
     session_factory: async_sessionmaker = Depends(get_session_factory),
+    rate_limiter: RateLimiter = Depends(get_rate_limiter),
 ) -> DocumentUploadResponse:
+    allowed, retry_after = rate_limiter.check(f"upload:{user_id}", UPLOAD_RULE)
+    if not allowed:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Too many uploads. Try again in {retry_after}s.",
+            headers={"Retry-After": str(retry_after)},
+        )
+
     filename = (file.filename or "").strip() or "untitled"
     if not filename.lower().endswith(SUPPORTED_EXTENSIONS):
         raise HTTPException(

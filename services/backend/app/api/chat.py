@@ -9,6 +9,7 @@ from sqlalchemy.orm import selectinload
 
 from app.api.deps import get_current_user_id
 from app.core.database import get_session, get_session_factory
+from app.core.ratelimit import CHAT_RULE, RateLimiter, get_rate_limiter
 from app.llm.base import LLMMessage, LLMProviderError
 from app.llm.registry import ModelUnavailableError
 from app.llm.router import LLMRouter, get_llm_router
@@ -90,8 +91,19 @@ async def send_message(
     memory_store: MemoryStore = Depends(get_memory_store),
     memory_writer: MemoryWriter = Depends(get_memory_writer),
     orchestrator: Orchestrator = Depends(get_orchestrator),
+    rate_limiter: RateLimiter = Depends(get_rate_limiter),
     session_factory: async_sessionmaker = Depends(get_session_factory),
 ) -> ChatMessageResponse:
+    # Before any work, including the routing call. A limiter that runs
+    # after the expensive part protects nothing.
+    allowed, retry_after = rate_limiter.check(f"chat:{user_id}", CHAT_RULE)
+    if not allowed:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Too many messages. Try again in {retry_after}s.",
+            headers={"Retry-After": str(retry_after)},
+        )
+
     if payload.conversation_id is not None:
         conversation = await _get_owned_conversation(session, payload.conversation_id, user_id)
         persona = get_persona(payload.persona or conversation.persona)

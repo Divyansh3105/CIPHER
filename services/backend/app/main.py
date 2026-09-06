@@ -79,4 +79,35 @@ async def unhandled_error_handler(request: Request, exc: Exception) -> JSONRespo
 
 @app.get("/health")
 def health_check():
+    """Liveness: is this process running.
+
+    Deliberately checks nothing else. A liveness probe that fails when the
+    database is briefly unreachable gets the container restarted, which does
+    not fix the database and does lose whatever was in flight.
+    """
     return {"status": "ok"}
+
+
+@app.get("/health/ready")
+async def readiness_check():
+    """Readiness: can this process actually serve a request.
+
+    Checks the database, because every meaningful endpoint needs it. Returns
+    503 when it cannot, so a load balancer stops sending traffic to a process
+    that would only produce errors -- while liveness above keeps it alive
+    long enough to recover.
+    """
+    from sqlalchemy import text as sql_text
+
+    from app.core.database import async_session_factory
+
+    try:
+        async with async_session_factory() as session:
+            await session.scalar(sql_text("SELECT 1"))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Readiness check failed: %s", exc)
+        return JSONResponse(
+            status_code=503,
+            content={"status": "not ready", "database": f"{type(exc).__name__}"},
+        )
+    return {"status": "ready", "database": "ok"}

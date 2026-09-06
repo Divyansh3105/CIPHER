@@ -65,6 +65,23 @@ from app.tools.registry import ToolRegistry, get_tool_registry
 get_settings.cache_clear()
 
 
+@pytest.fixture(autouse=True)
+def _reset_rate_limiter():
+    """Clear the process-wide limiter between tests.
+
+    It is a singleton for the same reason the kill switch is -- a per-request
+    limiter would count to one and never further -- which makes it shared
+    state. Without this, a suite that sends more than the per-minute
+    allowance starts failing with 429s in whichever test happens to run
+    twentieth, which is an extremely confusing thing to debug.
+    """
+    from app.core.ratelimit import get_rate_limiter
+
+    get_rate_limiter().reset()
+    yield
+    get_rate_limiter().reset()
+
+
 @pytest.fixture
 def dev_user_id():
     return get_settings().dev_user_id
