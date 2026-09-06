@@ -11,12 +11,14 @@ class FakeProvider(LLMProvider):
         self._fails = fails
         self._reply = reply
         self.calls = 0
+        self.models: list[str | None] = []
 
-    async def agenerate(self, messages: list[LLMMessage]) -> LLMResponse:
+    async def agenerate(self, messages: list[LLMMessage], model: str | None = None) -> LLMResponse:
         self.calls += 1
+        self.models.append(model)
         if self._fails:
             raise LLMProviderError(f"{self.name} is down")
-        return LLMResponse(content=self._reply, model=f"{self.name}-model", provider=self.name)
+        return LLMResponse(content=self._reply, model=model or f"{self.name}-model", provider=self.name)
 
 
 @pytest.mark.asyncio

@@ -59,14 +59,18 @@ class RecordingProvider(LLMProvider):
     def __init__(self, reply: str = "Acknowledged.") -> None:
         self.reply = reply
         self.calls: list[list[LLMMessage]] = []
+        # Per-call model override the router asked for (None = provider
+        # default). Lets Phase 4's pin tests assert which model actually ran.
+        self.models: list[str | None] = []
 
     @property
     def last_messages(self) -> list[LLMMessage]:
         return self.calls[-1]
 
-    async def agenerate(self, messages: list[LLMMessage]) -> LLMResponse:
+    async def agenerate(self, messages: list[LLMMessage], model: str | None = None) -> LLMResponse:
         self.calls.append(messages)
-        return LLMResponse(content=self.reply, model="fake-model", provider=self.name)
+        self.models.append(model)
+        return LLMResponse(content=self.reply, model=model or "fake-model", provider=self.name)
 
 
 @pytest.fixture
