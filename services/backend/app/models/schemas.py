@@ -73,6 +73,45 @@ class PersonaInfo(BaseModel):
     tagline: str
 
 
+# --- Phase 4: runtime model swap -----------------------------------------
+
+
+class ModelInfo(BaseModel):
+    """One entry in GET /models."""
+
+    id: str
+    provider: str
+    display_name: str
+    aliases: list[str]
+    note: str = ""
+
+
+class ActiveModel(BaseModel):
+    """What is answering right now.
+
+    `pinned` False means default routing is in effect (primary, with
+    automatic fallback). True means the user named this model and it will
+    NOT silently fall back -- see app/llm/router.py.
+    """
+
+    pinned: bool
+    id: str
+    provider: str
+    display_name: str
+    default_id: str
+
+
+class ModelSwapRequest(BaseModel):
+    # Free text on purpose: this is what the user said or typed, not an id.
+    # Resolution and refusal happen in app/llm/registry.py.
+    spoken: str = Field(min_length=1, max_length=200)
+
+
+class ModelsResponse(BaseModel):
+    active: ActiveModel
+    available: list[ModelInfo]
+
+
 # --- Phase 3: memory -----------------------------------------------------
 
 

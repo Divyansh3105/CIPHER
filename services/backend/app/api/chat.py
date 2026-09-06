@@ -10,6 +10,7 @@ from sqlalchemy.orm import selectinload
 from app.api.deps import get_current_user_id
 from app.core.database import get_session, get_session_factory
 from app.llm.base import LLMMessage, LLMProviderError
+from app.llm.registry import ModelUnavailableError
 from app.llm.router import LLMRouter, get_llm_router
 from app.memory.capture import MemoryWriter, get_memory_writer
 from app.memory.embedder import Embedder, EmbeddingError, get_embedder
@@ -148,6 +149,13 @@ async def send_message(
 
     try:
         response, fell_back = await llm_router.generate(llm_messages)
+    except ModelUnavailableError as exc:
+        # Separated from the generic case on purpose: this is a model the
+        # user explicitly pinned, and 409 + the pin's own message says which
+        # one failed. Answering on a different model instead would defeat
+        # the entire point of pinning one (app/llm/router.py).
+        await session.rollback()
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except LLMProviderError as exc:
         await session.rollback()
         raise HTTPException(status_code=502, detail=f"LLM providers unavailable: {exc}") from exc
