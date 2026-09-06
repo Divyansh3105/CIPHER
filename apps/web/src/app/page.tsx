@@ -10,9 +10,11 @@ import VoiceControls, { type VoiceState } from "@/components/VoiceControls";
 import ModelChip from "@/components/ModelChip";
 import { useSpeechInput, useSpeechOutput } from "@/hooks/useVoice";
 import { matchWakePhrase, WAKE_FOLLOW_UP_MS } from "@/lib/speech";
+import { useScreenShare } from "@/hooks/useScreenShare";
 import {
   type ActiveModel,
   ApiError,
+  askAboutImage,
   type ChatMessage,
   type ConversationSummary,
   clearActiveModel,
@@ -70,6 +72,11 @@ export default function Home() {
   // later -- but dropping it *silently* is how a voice assistant earns a
   // reputation for not listening, so the status line says so.
   const [droppedUtterance, setDroppedUtterance] = useState(false);
+
+  // Phase 7: screen sharing. The browser owns the capture, so nothing
+  // server-side can see the screen, and a frame is only ever taken at
+  // the moment a question is asked.
+  const screen = useScreenShare();
 
   // Hands-free: ignore everything until addressed by name. Opt-in per
   // session and never persisted -- see WAKE_WORD in @/lib/speech for why
@@ -267,6 +274,51 @@ export default function Home() {
     setError(null);
     setNotice(null);
 
+    // While a share is live, questions go to the vision endpoint with a
+    // freshly grabbed frame. If the share has ended, that is said plainly
+    // rather than answered from an old frame or from memory.
+    if (screen.sharing) {
+      const frame = await screen.capture();
+      if (!frame) {
+        setNotice("The screen share ended, so there was nothing to look at. Start it again to ask about your screen.");
+        return;
+      }
+      const optimistic: ChatMessage = {
+        id: `pending-${crypto.randomUUID()}`,
+        role: "user",
+        content,
+        persona,
+        created_at: new Date().toISOString(),
+        recalled_memories: [],
+        citations: [],
+      };
+      setMessages((prev) => [...prev, optimistic]);
+      pendingRef.current = true;
+      setPending(true);
+      try {
+        const seen = await askAboutImage(frame, content, persona);
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: `vision-${crypto.randomUUID()}`,
+            role: "assistant",
+            content: seen.answer,
+            persona,
+            created_at: new Date().toISOString(),
+            recalled_memories: [],
+            citations: [],
+          },
+        ]);
+        if (voiceReplies) speech.speak(seen.answer, persona);
+      } catch (err) {
+        setError(err instanceof ApiError ? err.message : "Could not look at that screen.");
+      } finally {
+        pendingRef.current = false;
+        setPending(false);
+      }
+      return;
+    }
+
     const optimisticUserMessage: ChatMessage = {
       id: `pending-${crypto.randomUUID()}`,
       role: "user",
@@ -413,6 +465,12 @@ export default function Home() {
               onReset={handleResetModel}
             />
             <Link
+              href="/control"
+              className="text-xs font-semibold uppercase tracking-wide text-zinc-500 hover:text-zinc-900 dark:text-zinc-400 dark:hover:text-zinc-100"
+            >
+              Control
+            </Link>
+            <Link
               href="/agents"
               className="text-xs font-semibold uppercase tracking-wide text-zinc-500 hover:text-zinc-900 dark:text-zinc-400 dark:hover:text-zinc-100"
             >
@@ -450,6 +508,29 @@ export default function Home() {
           activePersonaLabel={activeLabel}
           personas={personas}
         />
+        {screen.supported && (
+          <div className="flex items-center gap-3 border-t border-zinc-200 px-4 py-2 dark:border-zinc-800">
+            <button
+              type="button"
+              onClick={() => (screen.sharing ? screen.stop() : void screen.start())}
+              className={[
+                "shrink-0 rounded-lg border px-3 py-1 text-xs font-semibold",
+                screen.sharing
+                  ? "border-red-500 bg-red-500 text-white"
+                  : "border-zinc-300 text-zinc-600 hover:border-zinc-500 dark:border-zinc-700 dark:text-zinc-300",
+              ].join(" ")}
+            >
+              {screen.sharing ? "Stop sharing" : "Show your screen"}
+            </button>
+            <p className="truncate text-xs text-zinc-500 dark:text-zinc-400">
+              {screen.error
+                ? screen.error
+                : screen.sharing
+                  ? `${activeLabel} can see the shared window. Every question grabs a fresh frame.`
+                  : "Share a window and ask about what is on it."}
+            </p>
+          </div>
+        )}
         <VoiceControls
           state={voiceState}
           micOn={mic.enabled}

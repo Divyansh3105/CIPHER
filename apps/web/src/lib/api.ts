@@ -396,3 +396,135 @@ export function listAgentRuns(conversationId?: string): Promise<AgentRun[]> {
   const query = conversationId ? `?conversation_id=${encodeURIComponent(conversationId)}` : "";
   return request<AgentRun[]>(`/agents/runs${query}`);
 }
+
+// --- Phase 7: automation and vision ----------------------------------
+
+export type RiskTier = "read_only" | "session" | "sensitive";
+export type PermissionLevel = "session" | "trusted";
+export type ActivityOutcome = "approved" | "denied" | "executed" | "failed" | "blocked";
+
+export interface ActionInfo {
+  name: string;
+  description: string;
+  category: string;
+  risk: RiskTier;
+  // Whether it could run right now with no further approval.
+  allowed_now: boolean;
+  // Empty when allowed_now. Says what is missing, so the UI can offer the
+  // fix rather than only reporting a wall.
+  reason: string;
+  // True for every sensitive action, always — a session approval never
+  // silently covers those.
+  needs_confirmation: boolean;
+}
+
+export interface AutomationStatus {
+  // False when AUTOMATION_ENABLED is unset. Nothing runs in that state.
+  enabled: boolean;
+  kill_switch_engaged: boolean;
+  actions: ActionInfo[];
+  notice: string;
+}
+
+export interface ActivityLogEntry {
+  id: string;
+  action_name: string;
+  category: string;
+  risk: RiskTier;
+  persona: string | null;
+  arguments: Record<string, unknown>;
+  outcome: ActivityOutcome;
+  reason: string | null;
+  result: string | null;
+  created_at: string;
+}
+
+export interface AutomationExecuteResult {
+  action_name: string;
+  outcome: string;
+  summary: string;
+  detail: string;
+}
+
+export function getAutomationStatus(): Promise<AutomationStatus> {
+  return request<AutomationStatus>("/automation/actions");
+}
+
+export function approveAction(actionName: string, level: PermissionLevel = "session"): Promise<AutomationStatus> {
+  return request<AutomationStatus>("/automation/permissions", {
+    method: "POST",
+    body: JSON.stringify({ action_name: actionName, level }),
+  });
+}
+
+export function revokeAction(actionName: string): Promise<AutomationStatus> {
+  return request<AutomationStatus>(`/automation/permissions/${encodeURIComponent(actionName)}`, {
+    method: "DELETE",
+  });
+}
+
+export function engageKillSwitch(): Promise<AutomationStatus> {
+  return request<AutomationStatus>("/automation/stop", { method: "POST" });
+}
+
+export function releaseKillSwitch(): Promise<AutomationStatus> {
+  return request<AutomationStatus>("/automation/resume", { method: "POST" });
+}
+
+export function listActivityLog(): Promise<ActivityLogEntry[]> {
+  return request<ActivityLogEntry[]>("/automation/log");
+}
+
+// `confirmed` is the per-action confirmation. It is required for every
+// sensitive action, every time, regardless of any standing approval — so it
+// is a parameter here rather than something the client can forget.
+export function executeAction(
+  actionName: string,
+  args: Record<string, unknown>,
+  options?: { confirmed?: boolean; persona?: string }
+): Promise<AutomationExecuteResult> {
+  return request<AutomationExecuteResult>("/automation/execute", {
+    method: "POST",
+    body: JSON.stringify({
+      action_name: actionName,
+      arguments: args,
+      confirmed: options?.confirmed ?? false,
+      persona: options?.persona ?? null,
+    }),
+  });
+}
+
+export interface VisionResult {
+  answer: string;
+  model_used: string;
+}
+
+// Multipart, so it bypasses request<T>() for the same reason uploadDocument
+// does: the browser must set its own boundary.
+export async function askAboutImage(
+  blob: Blob,
+  question: string,
+  persona: string
+): Promise<VisionResult> {
+  const form = new FormData();
+  form.append("image", blob, "frame.jpg");
+  form.append("question", question);
+  form.append("persona", persona);
+
+  let response: Response;
+  try {
+    response = await fetch(`${API_BASE_URL}/vision`, { method: "POST", body: form });
+  } catch {
+    throw new ApiError(0, `Could not reach the backend. Is it running on ${API_BASE_URL}?`);
+  }
+  if (!response.ok) {
+    let detail = response.statusText;
+    try {
+      detail = (await response.json()).detail ?? detail;
+    } catch {
+      // not JSON; keep statusText
+    }
+    throw new ApiError(response.status, detail);
+  }
+  return response.json() as Promise<VisionResult>;
+}
