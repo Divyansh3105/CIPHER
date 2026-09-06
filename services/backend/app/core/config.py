@@ -42,6 +42,17 @@ class Settings(BaseSettings):
     search_api_key: str | None = None
     picovoice_access_key: str | None = None
 
+    # Phase 7: computer control. Off unless explicitly enabled, so a fresh
+    # clone cannot act on anyone's machine. Read through Settings (and
+    # therefore .env) rather than os.environ alone -- uvicorn does not load
+    # .env into the process environment, so an os.environ-only read silently
+    # ignored the file this project documents the setting in.
+    automation_enabled: bool = False
+    #: Comma-separated absolute paths `list_directory` may read.
+    automation_allowed_dirs: str = ""
+    #: Comma-separated name=executable pairs `open_app` may launch.
+    automation_allowed_apps: str = ""
+
     # Security
     jwt_secret_key: str | None = None
     session_secret: str | None = None

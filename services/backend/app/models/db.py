@@ -1,10 +1,11 @@
 """SQLAlchemy ORM models.
 
 users, conversations, messages (Phase 1); memories (Phase 3); documents and
-document_chunks (Phase 5); agents and agent_runs (Phase 6).
+document_chunks (Phase 5); agents and agent_runs (Phase 6); tools,
+permissions and activity_logs (Phase 7).
 
-Later phases add `tasks`, `tools`, `permissions`, and `activity_logs` (see
-docs/architecture.md, Section 12) -- deliberately not created yet.
+Later phases add `tasks` and `notifications` (see docs/architecture.md,
+Section 12) -- deliberately not created yet.
 """
 import uuid
 from datetime import datetime
@@ -94,6 +95,86 @@ class Message(Base):
     __table_args__ = (
         Index("ix_messages_conversation_id", "conversation_id"),
     )
+
+
+class ToolRecord(Base):
+    """Registry row for an automation action (Phase 7).
+
+    Named ToolRecord rather than Tool because `app.tools.base.Tool` already
+    means something different -- a retrieval tool the model may call, with no
+    permission model at all. Two things called Tool in one codebase, one of
+    which is safety-critical and one of which is not, is a confusion worth
+    spending a longer name to avoid.
+    """
+
+    __tablename__ = "tools"
+
+    id: Mapped[uuid.UUID] = mapped_column(PgUuid, primary_key=True, default=uuid.uuid4)
+    name: Mapped[str] = mapped_column(String(60), nullable=False, unique=True)
+    description: Mapped[str] = mapped_column(Text, nullable=False)
+    category: Mapped[str] = mapped_column(String(40), nullable=False)
+    #: "read_only" | "session" | "sensitive"
+    risk: Mapped[str] = mapped_column(String(20), nullable=False)
+    requires_permission: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class Permission(Base):
+    """A grant that lets an action category run (Phase 7).
+
+    Revoked grants are marked, never deleted, so "what was approved, when,
+    and when did it stop" stays answerable. The live grant is the newest row
+    that is neither revoked nor expired.
+    """
+
+    __tablename__ = "permissions"
+
+    id: Mapped[uuid.UUID] = mapped_column(PgUuid, primary_key=True, default=uuid.uuid4)
+    user_id: Mapped[uuid.UUID] = mapped_column(PgUuid, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    #: An action name or a category. Not a FK -- a grant usually covers a
+    #: category, which is not a row in `tools`.
+    action_name: Mapped[str] = mapped_column(String(60), nullable=False)
+    #: "session" (expires) | "trusted" (until revoked)
+    level: Mapped[str] = mapped_column(String(20), nullable=False)
+    granted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    #: None means "until revoked" -- the trusted allowlist.
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    __table_args__ = (Index("ix_permissions_user_action", "user_id", "action_name"),)
+
+
+class ActivityLog(Base):
+    """One attempted action, whatever became of it (Phase 7).
+
+    Deliberately has NO foreign keys and NO cascade. An audit log that can be
+    erased by deleting the thing it describes is not an audit log: rows here
+    outlive the action definition, the permission grant, the conversation and
+    the user row. Retention is a policy decision, never a side effect of
+    another delete.
+
+    `persona` is recorded because docs/architecture.md Section 9 says the
+    permission boundary applies to all three personas equally -- so if it
+    ever did not, this column is where that would become visible.
+    """
+
+    __tablename__ = "activity_logs"
+
+    id: Mapped[uuid.UUID] = mapped_column(PgUuid, primary_key=True, default=uuid.uuid4)
+    user_id: Mapped[uuid.UUID] = mapped_column(PgUuid, nullable=False)
+    action_name: Mapped[str] = mapped_column(String(60), nullable=False)
+    category: Mapped[str] = mapped_column(String(40), nullable=False)
+    risk: Mapped[str] = mapped_column(String(20), nullable=False)
+    persona: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    #: Requested arguments, after redaction (see guard._redact).
+    arguments: Mapped[dict] = mapped_column(PgJson, nullable=False, default=dict, server_default=text("'{}'"))
+    #: "approved" | "denied" | "executed" | "failed" | "blocked"
+    outcome: Mapped[str] = mapped_column(String(20), nullable=False)
+    reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    result: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (Index("ix_activity_logs_user_created", "user_id", "created_at"),)
 
 
 class Agent(Base):
