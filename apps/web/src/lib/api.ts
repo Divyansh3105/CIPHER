@@ -16,6 +16,21 @@ export interface RecalledMemory {
   similarity: number;
 }
 
+export interface Citation {
+  kind: "document" | "web";
+  // document
+  document_id?: string | null;
+  filename?: string | null;
+  page_number?: number | null;
+  content?: string | null;
+  similarity?: number | null;
+  // web
+  title?: string | null;
+  url?: string | null;
+  snippet?: string | null;
+  provider?: string | null;
+}
+
 export interface ChatMessage {
   id: string;
   role: Role;
@@ -28,6 +43,10 @@ export interface ChatMessage {
   // something to silently default away. See ChatMessageBubble/
   // RecalledMemoryChips for where this renders.
   recalled_memories: RecalledMemory[];
+  // Phase 5: what grounded this reply -- document passages or web results.
+  // Same snapshot reasoning: a citation must keep saying what the answer was
+  // based on, even after the document is deleted.
+  citations: Citation[];
 }
 
 export interface ChatMessageResponse {
@@ -38,6 +57,12 @@ export interface ChatMessageResponse {
   // True when the persona's output filter (ULTRON only, today) replaced the
   // model's reply with a safety refusal.
   filtered: boolean;
+  // Phase 5. null means no tool ran -- INCLUDING when one was attempted and
+  // failed, in which case tool_summary says so. "Answered from memory" and
+  // "tried to look it up and could not" deserve different amounts of trust,
+  // so the UI has to be able to tell them apart.
+  tool_used: string | null;
+  tool_summary: string;
 }
 
 export interface ConversationSummary {
@@ -252,4 +277,79 @@ export function getMemoryGraph(options?: {
   if (options?.minSimilarity != null) params.set("min_similarity", String(options.minSimilarity));
   const query = params.toString();
   return request<MemoryGraph>(`/memory/graph${query ? `?${query}` : ""}`);
+}
+
+// --- Phase 5: documents, tools, citations ----------------------------
+
+export type DocumentStatus = "pending" | "ready" | "failed";
+
+export interface DocumentRecord {
+  id: string;
+  filename: string;
+  content_type: string;
+  size_bytes: number;
+  status: DocumentStatus;
+  // Populated when status is "failed", and written for a person to read.
+  // A document that silently never becomes searchable is the worst outcome,
+  // so this is always shown rather than logged.
+  error: string | null;
+  chunk_count: number;
+  page_count: number | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface DocumentUploadResult {
+  document: DocumentRecord;
+  // True when the same text was already uploaded. Not an error: the backend
+  // returns 201 and points at the existing document.
+  deduplicated: boolean;
+}
+
+export interface ToolInfo {
+  name: string;
+  description: string;
+  requires_permission: boolean;
+  // Whether it can run right now, and why not if it cannot.
+  available: boolean;
+  reason: string;
+}
+
+export function listDocuments(): Promise<DocumentRecord[]> {
+  return request<DocumentRecord[]>("/documents");
+}
+
+export function deleteDocument(id: string): Promise<{ deleted: number; chunks_removed: number }> {
+  return request<{ deleted: number; chunks_removed: number }>(`/documents/${id}`, {
+    method: "DELETE",
+  });
+}
+
+export function listTools(): Promise<ToolInfo[]> {
+  return request<ToolInfo[]>("/tools");
+}
+
+// Not routed through request<T>(): that sets Content-Type: application/json,
+// and a multipart upload needs the browser to set its own boundary. Setting
+// it by hand produces a 422 that looks like a validation bug.
+export async function uploadDocument(file: File): Promise<DocumentUploadResult> {
+  const form = new FormData();
+  form.append("file", file);
+
+  let response: Response;
+  try {
+    response = await fetch(`${API_BASE_URL}/documents`, { method: "POST", body: form });
+  } catch {
+    throw new ApiError(0, `Could not reach the backend. Is it running on ${API_BASE_URL}?`);
+  }
+  if (!response.ok) {
+    let detail = response.statusText;
+    try {
+      detail = (await response.json()).detail ?? detail;
+    } catch {
+      // not JSON; keep statusText
+    }
+    throw new ApiError(response.status, detail);
+  }
+  return response.json() as Promise<DocumentUploadResult>;
 }
