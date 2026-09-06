@@ -292,11 +292,11 @@ export default function Home() {
         // selected in the switcher.
         speech.speak(result.message.content, result.message.persona ?? persona);
       }
-      if (result.tool_summary && !result.tool_used) {
-        // A tool was attempted and failed. Saying so matters more than it
-        // looks: the reply that follows is ungrounded, and the user would
+      if (result.activity && !result.agent_used) {
+        // A specialist was attempted and failed. Saying so matters more than
+        // it looks: the reply that follows is ungrounded, and the user would
         // otherwise assume it had been looked up.
-        setNotice(`Couldn't look that up — ${result.tool_summary}. Answered without it.`);
+        setNotice(`Couldn't look that up — ${result.activity}. Answered without it.`);
       } else if (result.filtered) {
         setNotice(
           `${personaLabel(personas, result.message.persona)}'s safety filter replaced that reply -- it crossed a line the persona enforces.`
@@ -412,6 +412,12 @@ export default function Home() {
               onSelect={handleSelectModel}
               onReset={handleResetModel}
             />
+            <Link
+              href="/agents"
+              className="text-xs font-semibold uppercase tracking-wide text-zinc-500 hover:text-zinc-900 dark:text-zinc-400 dark:hover:text-zinc-100"
+            >
+              Agents
+            </Link>
             <Link
               href="/documents"
               className="text-xs font-semibold uppercase tracking-wide text-zinc-500 hover:text-zinc-900 dark:text-zinc-400 dark:hover:text-zinc-100"

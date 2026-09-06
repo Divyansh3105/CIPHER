@@ -57,12 +57,12 @@ export interface ChatMessageResponse {
   // True when the persona's output filter (ULTRON only, today) replaced the
   // model's reply with a safety refusal.
   filtered: boolean;
-  // Phase 5. null means no tool ran -- INCLUDING when one was attempted and
-  // failed, in which case tool_summary says so. "Answered from memory" and
-  // "tried to look it up and could not" deserve different amounts of trust,
-  // so the UI has to be able to tell them apart.
-  tool_used: string | null;
-  tool_summary: string;
+  // Phase 6. null means nothing contributed -- INCLUDING when a specialist
+  // was chosen and failed, in which case `activity` says so. "Answered
+  // directly" and "tried a specialist and it did not work" deserve different
+  // amounts of trust, so the UI has to be able to tell them apart.
+  agent_used: string | null;
+  activity: string;
 }
 
 export interface ConversationSummary {
@@ -352,4 +352,47 @@ export async function uploadDocument(file: File): Promise<DocumentUploadResult> 
     throw new ApiError(response.status, detail);
   }
   return response.json() as Promise<DocumentUploadResult>;
+}
+
+// --- Phase 6: agents -------------------------------------------------
+
+export type AgentRunStatus = "ok" | "failed" | "timeout" | "skipped";
+
+export interface AgentInfo {
+  name: string;
+  description: string;
+  timeout_seconds: number;
+  // False means switched off; the router is not offered it at all.
+  enabled: boolean;
+}
+
+export interface AgentRun {
+  id: string;
+  agent_name: string;
+  conversation_id: string | null;
+  input: string;
+  output: string | null;
+  status: AgentRunStatus;
+  error: string | null;
+  duration_ms: number;
+  created_at: string;
+}
+
+export function listAgents(): Promise<AgentInfo[]> {
+  return request<AgentInfo[]>("/agents");
+}
+
+export function setAgentEnabled(name: string, enabled: boolean): Promise<AgentInfo> {
+  return request<AgentInfo>(`/agents/${encodeURIComponent(name)}`, {
+    method: "PATCH",
+    body: JSON.stringify({ enabled }),
+  });
+}
+
+// Failed, timed-out and did-nothing runs come back alongside successful
+// ones. An activity view that lists only what worked lies by omission, and
+// "why was that answer ungrounded" is the question this exists to answer.
+export function listAgentRuns(conversationId?: string): Promise<AgentRun[]> {
+  const query = conversationId ? `?conversation_id=${encodeURIComponent(conversationId)}` : "";
+  return request<AgentRun[]>(`/agents/runs${query}`);
 }
