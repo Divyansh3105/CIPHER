@@ -441,12 +441,17 @@ async def check_tools_and_rag(client: httpx.AsyncClient, report: Report) -> None
         citations = payload["message"].get("citations", [])
         cited = [c for c in citations if c.get("kind") == "document"]
 
-        if payload.get("tool_used") == "document_search":
-            report.ok("planner chose document_search", payload.get("tool_summary", ""))
+        # Phase 6 renamed these: the orchestrator picks an *agent*, and the
+        # research agent then picks the document_search tool. The activity
+        # line is what names the tool now.
+        activity = payload.get("activity", "")
+        if payload.get("agent_used") == "research" and "document" in activity:
+            report.ok("routed to research, which searched documents", activity)
         else:
             report.fail(
-                "planner chose document_search",
-                f"tool_used={payload.get('tool_used')!r} -- the question was explicitly about uploaded documents",
+                "routed to research, which searched documents",
+                f"agent_used={payload.get('agent_used')!r} activity={activity!r} -- "
+                f"the question was explicitly about uploaded documents",
             )
 
         if cited:
@@ -468,6 +473,69 @@ async def check_tools_and_rag(client: httpx.AsyncClient, report: Report) -> None
     finally:
         if document_id:
             await client.delete(f"/documents/{document_id}")
+
+
+async def check_agents(client: httpx.AsyncClient, report: Report) -> None:
+    """Phase 6: the orchestrator routes, and every run is recorded.
+
+    The audit trail is the check worth having. Routing itself already shows
+    up in the RAG check above -- if the research agent were not being chosen,
+    the document round trip would fail. What that does not prove is that the
+    run was *recorded*, and an activity view that silently records nothing is
+    exactly as useless as no activity view while looking perfectly healthy.
+    """
+    section("Agents")
+    try:
+        agents = (await client.get("/agents")).json()
+    except (httpx.HTTPError, ValueError) as exc:
+        report.fail("GET /agents", f"{type(exc).__name__}: {exc}")
+        return
+
+    names = {a["name"] for a in agents}
+    if {"research", "coding", "memory"} <= names:
+        report.ok("GET /agents", ", ".join(sorted(names)))
+    else:
+        report.fail("GET /agents", f"expected research, coding and memory; got {sorted(names)}")
+
+    disabled = [a["name"] for a in agents if not a["enabled"]]
+    if disabled:
+        report.warn("all agents enabled", f"switched off: {', '.join(disabled)}")
+    else:
+        report.ok("all agents enabled")
+
+    before = len((await client.get("/agents/runs")).json())
+
+    answer = await client.post(
+        "/chat/message",
+        json={"content": f"Write a one-line Python function called {MARKER.replace('-', '_')}_add that adds two numbers."},
+        timeout=120.0,
+    )
+    if answer.status_code != 200:
+        report.fail("a coding question routes to a specialist", f"{answer.status_code} {answer.text[:120]}")
+        return
+
+    payload = answer.json()
+    if payload.get("agent_used") == "coding":
+        report.ok("a coding question routes to the coding agent")
+    else:
+        report.warn(
+            "a coding question routes to the coding agent",
+            f"router chose {payload.get('agent_used')!r} -- routing is a model decision, so this is "
+            f"a signal about prompt quality rather than a broken system",
+        )
+
+    runs = (await client.get("/agents/runs")).json()
+    if len(runs) > before:
+        newest = runs[0]
+        report.ok(
+            "the run was recorded",
+            f"{newest['agent_name']} {newest['status']} in {newest['duration_ms']}ms",
+        )
+    else:
+        report.fail(
+            "the run was recorded",
+            "an agent ran but no row was written -- the activity view is blind",
+        )
 
 
 async def check_model_swap(client: httpx.AsyncClient, report: Report) -> None:
@@ -574,6 +642,11 @@ async def cleanup(report: Report) -> None:
             )
             removed_documents = result.rowcount or 0
             result = await session.execute(
+                text("DELETE FROM agent_runs WHERE input ILIKE :pattern"),
+                {"pattern": f"%{MARKER.replace('-', '_')}%"},
+            )
+            removed_runs = result.rowcount or 0
+            result = await session.execute(
                 text(
                     "DELETE FROM conversations WHERE id IN ("
                     "  SELECT conversation_id FROM messages WHERE content ILIKE :pattern"
@@ -582,11 +655,20 @@ async def cleanup(report: Report) -> None:
                 {"pattern": "%archival subsystem%"},
             )
             removed_conversations += result.rowcount or 0
+            result = await session.execute(
+                text(
+                    "DELETE FROM conversations WHERE id IN ("
+                    "  SELECT conversation_id FROM messages WHERE content ILIKE :pattern"
+                    ")"
+                ),
+                {"pattern": f"%{MARKER.replace('-', '_')}_add%"},
+            )
+            removed_conversations += result.rowcount or 0
             await session.commit()
         report.ok(
             "test data removed",
             f"{removed_memories} memories, {removed_documents} documents, "
-            f"{removed_conversations} conversations",
+            f"{removed_runs} agent runs, {removed_conversations} conversations",
         )
     except Exception as exc:  # noqa: BLE001
         report.warn("test data removed", f"{type(exc).__name__}: {exc} -- check the dashboard for stray rows")
@@ -614,6 +696,7 @@ async def main(all_models: bool, skip_llm: bool) -> int:
             await check_chat_and_memory(client, report)
             await check_memory_graph(client, report)
             await check_tools_and_rag(client, report)
+            await check_agents(client, report)
             await check_model_swap(client, report)
             await cleanup(report)
         print(f"\nfinished in {time.monotonic() - started:.1f}s")
