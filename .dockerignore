@@ -1,0 +1,31 @@
+# Secrets never enter the build context. .env is the one file that must not
+# be baked into an image -- an image layer is readable by anyone who can pull
+# it, and deleting the file in a later layer does not remove it from the
+# earlier one.
+.env
+.env.*
+!.env.example
+
+# Virtual environments: large, platform-specific, and rebuilt inside the
+# image anyway. Copying a Windows venv into a Linux container produces
+# binaries that cannot run.
+.venv/
+venv/
+services/backend/venv/
+**/__pycache__/
+*.pyc
+
+# Frontend: deployed to Vercel, not into the backend image.
+apps/web/node_modules/
+apps/web/.next/
+apps/web/out/
+
+# Nothing the runtime needs.
+.git/
+.github/
+.claude/
+.playwright-mcp/
+**/.pytest_cache/
+docs/
+*.md
+!services/backend/**/*.md

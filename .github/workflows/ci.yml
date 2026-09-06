@@ -1,0 +1,91 @@
+# CI for CIPHER (Phase 8).
+#
+# Runs on every push and pull request. Deliberately does NOT deploy: the
+# blueprint suggests auto-deploying main, and that is a decision to make
+# once, knowingly, with the deploy credentials in hand -- not something to
+# inherit from a template. See docs/deployment.md for the manual steps.
+#
+# What this proves on every change:
+#   - the backend suite passes (no live credentials needed: it runs against
+#     in-memory SQLite with fake providers)
+#   - the frontend typechecks, lints, and actually builds
+#
+# What it deliberately does not run: scripts/preflight.py. That makes real,
+# billable calls against real keys, and CI has neither. Preflight is a
+# pre-release step run by a human against a running system.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  # A new push supersedes an in-flight run for the same ref. Free CI minutes
+  # are finite and a superseded run tells you nothing.
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend:
+    name: Backend tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: services/backend/requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r services/backend/requirements.txt
+
+      - name: Run tests
+        working-directory: services/backend
+        # No secrets. conftest.py supplies placeholder credentials and pins
+        # automation off, so a green CI run says nothing about anyone's .env.
+        run: python -m pytest -q
+
+  frontend:
+    name: Frontend build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/web
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: apps/web/package-lock.json
+
+      - name: Install dependencies
+        # `npm ci` rather than `npm install`: it installs exactly the
+        # lockfile, so CI cannot pass on a dependency tree that no one has.
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Typecheck
+        run: npx tsc --noEmit
+
+      - name: Build
+        # The build is the check that catches what lint and tsc cannot --
+        # the Suspense boundary a static route needs, for one.
+        run: npm run build
+
+  docker:
+    name: Backend image builds
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        # Built but not pushed: proving the Dockerfile is valid costs a
+        # minute, and a registry is a decision with credentials attached.
+        run: docker build -f services/backend/Dockerfile -t cipher-backend:ci .
