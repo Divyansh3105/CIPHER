@@ -446,13 +446,56 @@ Only technologies actually present in the codebase or `requirements.txt`/`packag
 
 **Objective:** A web search tool, plus document upload with retrieval-augmented generation and citations.
 
-**What Was Done:** Not yet started.
+**What Was Done:**
 
-**Challenges Faced:** None — not yet started.
+*RAG pipeline (`app/rag/`):*
+- `extract.py` — PDF, DOCX, TXT and Markdown, returning **pages** rather than a string. Named failures rather than generic ones: a scanned PDF says it needs OCR, a password-protected one says so, a `.doc` says to save it as `.docx`
+- `chunk.py` — ~2600-character windows with ~400 of overlap (the blueprint's 500-800 tokens at ~4 chars/token), split on paragraph then sentence boundaries. **Chunks never span pages**, which is the only reason a citation can say "page 4" and be right
+- `store.py` — `PgVectorDocumentStore` over a real `vector(768)` column with an HNSW index (migration `0003_documents`), scoped by user and restricted to documents that finished indexing
+- `ingest.py` — background extract/chunk/embed. Records `status` and a readable `error` on every failure path, because a document that silently never becomes searchable is the worst possible outcome
 
-**How the Challenges Were Overcome:** Not applicable.
+*Tools (`app/tools/`):*
+- A `Tool` interface with a `requires_permission` flag declared now and enforced in Phase 7, rather than retrofitted onto a design that assumed every tool was safe
+- `search.py` — web search behind a provider abstraction: Tavily when `SEARCH_API_KEY` is set, DuckDuckGo Instant Answers when it is not. They are **not equivalent**, so which one ran is reported in every result
+- `documents.py` — retrieval over uploaded files, grouped by source in the prompt so the model cites reliably
+- `planner.py` — one JSON-returning LLM call that picks a tool or none. Refuses an unrecognised tool name rather than matching it to the nearest, and short-circuits small talk before spending a round trip
+- `registry.py` — reports *availability*, not just existence: document search is withheld until something is actually indexed
 
-**Phase Status:** ⏳ Planned
+*API and frontend:*
+- `POST/GET/DELETE /documents` and `GET /tools`; `messages.citations` persisted as a snapshot, for the same reason as `recalled_memories`
+- A `/documents` dashboard with live ingestion status, per-file failure reasons, and a "what it can look up" capability line
+- Green page-numbered citation chips on replies, and a banner when a tool was attempted and failed
+
+*Testing performed:*
+- 45 new backend tests (extraction and chunking invariants, upload/dedup/scoping, planner refusal and degradation, tool failure isolation) — full suite **228/228**
+- `scripts/preflight.py` gained a full document round trip: upload a file, wait for background ingestion, ask a question whose answer is a codename **no model has ever seen**, and assert the reply contains it with a citation. 29 live checks
+- Verified live: a real 12-page PDF ingested to 13 passages, then answered correctly with page-numbered citations; a web question answered from real Tavily results; small talk correctly using no tool at all
+
+**Challenges Faced:**
+1. Two providers with incompatible function-calling schemas, and an `LLMProvider` abstraction that exists so nothing above it knows which provider answered.
+2. The document search summary reported "4 passages from 5 files" for four passages out of one PDF.
+3. Two documents uploaded in the same second came back in a different order on each request.
+4. Gemini's free-tier quota ran out mid-verification.
+
+**How the Challenges Were Overcome:**
+
+**Challenge 1 — function-calling would undo the provider abstraction.**
+**Solution:** A plain-text planner (`app/tools/planner.py`) that returns JSON, instead of vendor function-calling. It works on any model that can follow an instruction, so swapping providers stays a config change.
+**Result:** Tool use with no vendor lock-in, at the cost of one extra round trip per non-trivial message — stated plainly in the code rather than hidden, and mitigated by filtering small talk before the planner is called at all.
+
+**Challenge 2 — a count that could not be true.**
+**Solution:** The summary counted `grouped`, which is keyed by *citation string* — and that includes the page number, so five pages of one PDF counted as five "files". Fixed to count distinct filenames.
+**Result:** "4 passages from 1 file". Caught by reading the tool's own output during live verification, not by a test — the unit tests asserted on citations, never on the sentence shown to the user.
+
+**Challenge 3 — unstable list ordering.**
+**Solution:** `created_at` has one-second resolution, so simultaneous uploads tie and the order flipped between requests. Added `id` as an explicit tiebreaker.
+**Result:** Deterministic ordering, pinned by a test that fetches twice and compares.
+
+**Challenge 4 — running out of free-tier quota.**
+**Solution:** The router's Gemini-to-Groq fallback did its job and chat kept working, but preflight reported the 429 as a hard failure, which is misleading — the model is fine, the day's allowance is spent. Quota exhaustion is now a **warn** with an explicit message, and other failures stay hard failures.
+**Result:** Red output stays meaningful. Worth noting as an operational fact: Phase 5's planner **doubles** the LLM calls per non-trivial message, which is felt on a free tier.
+
+**Phase Status:** ✅ Completed — RAG pipeline, both tools, the planner, the APIs, the dashboard and citations are all built and verified live. 228/228 backend tests, 29 preflight checks, clean production build.
 
 ---
 
@@ -507,8 +550,8 @@ Only technologies actually present in the codebase or `requirements.txt`/`packag
 | Phase 2 | Personality System (FRIDAY, ULTRON, switcher) | ✅ Completed |
 | Phase 3 | Memory (vector search, memory dashboard) | ✅ Completed |
 | Phase 4 | Voice, runtime model swap, preflight, memory galaxy | ✅ Completed |
-| Phase 5 | Tools & RAG (web search, documents) | ⏳ Planned (next) |
-| Phase 6 | Multi-Agent System | ⏳ Planned |
+| Phase 5 | Tools & RAG (web search, documents) | ✅ Completed |
+| Phase 6 | Multi-Agent System | ⏳ Planned (next) |
 | Phase 7 | Advanced Features (vision, computer control) | ⏳ Planned |
 | Phase 8 | Production & Deployment | ⏳ Planned |
 
@@ -524,7 +567,9 @@ Only technologies actually present in the codebase or `requirements.txt`/`packag
 
 - The habit worth carrying forward: **run `python -m scripts.preflight` before calling anything done.** It caught a 503 on a live endpoint while all 183 unit tests were green, because the SQLite test fake reimplements that query in Python and never runs the SQL.
 
-Phases 5 through 8 have not been started; their objectives above are drawn directly from `docs/architecture.md`.
+- Phase 5 is **complete**: documents can be uploaded and asked about with page-numbered citations, and the web can be searched. Tool use is a planner call rather than provider function-calling, so swapping LLM providers stays a config change — see [Section 5](#5-development-phases).
+
+Phases 6 through 8 have not been started; their objectives above are drawn directly from `docs/architecture.md`.
 
 ---
 
@@ -604,12 +649,15 @@ flowchart LR
 - [x] 3D memory galaxy — the memory store as a force-directed graph, with the Recalled chips in chat deep-linking to the exact node that answered
 - [x] `scripts/preflight.py` — 23 live end-to-end checks against a running system, non-zero exit on any failure
 - [x] `scripts/memory_graph_calibrate.py` — measures real embedding similarity so the graph's settings are derived rather than guessed
-- [x] Backend automated test suite (183 tests, in-memory database, no live credentials needed)
+- [x] Document upload with background indexing — PDF, DOCX, TXT and Markdown, with per-file status and readable failure reasons
+- [x] Document Q&A with **page-numbered citations** — chunks never span pages, so "page 4" is always true
+- [x] Web search — Tavily when a key is set, a keyless provider when it is not, with the difference reported rather than hidden
+- [x] Provider-agnostic tool planner — refuses unrecognised tool names, skips small talk, and degrades to no tool rather than erroring
+- [x] Backend automated test suite (228 tests, in-memory database, no live credentials needed)
 
 ### Planned
 - [ ] Real user authentication via Supabase Auth
 - [ ] Speech-to-text off the browser (Groq `whisper-large-v3`, or local Whisper), if the Chrome-only constraint starts to bite
-- [ ] Web search tool and document RAG with citations (Phase 5)
 - [ ] Multi-agent orchestration (Phase 6)
 - [ ] Vision and permissioned computer control (Phase 7)
 - [ ] Production deployment and CI/CD (Phase 8)
@@ -692,7 +740,7 @@ All variables are read from a single repo-root `.env` file (see `.env.example` f
 | `DEV_USER_ID` | Fixed UUID every request is attributed to while real auth doesn't exist yet | No — has a built-in default |
 | `GEMINI_API_KEY` | Google Gemini API key (primary LLM, and embeddings for long-term memory) | **Yes** |
 | `GROQ_API_KEY` | Groq API key (fallback LLM) | **Yes** |
-| `SEARCH_API_KEY` | Web search provider key | No — reserved for Phase 5 |
+| `SEARCH_API_KEY` | Tavily key for web search | No — without it, search falls back to a keyless provider that returns encyclopaedic lookups rather than ranked web results |
 | `PICOVOICE_ACCESS_KEY` | Wake-word detection key | No — and not needed even for Phase 4. The shipped voice loop uses the browser (no key); wake word is optional and has two keyless alternatives, see `.env.example` |
 | `JWT_SECRET_KEY` | Session/JWT signing secret | No — not yet used |
 | `SESSION_SECRET` | Session signing secret | No — not yet used |
@@ -704,7 +752,7 @@ No API keys, passwords, tokens, or other credentials are included in this docume
 ## 12. Future Roadmap
 
 ### Short-Term
-- Begin Phase 5 — a web search tool and document-grounded RAG with citations.
+- Begin Phase 6 — multi-agent orchestration (specialised Research/Memory/Coding agents) with an activity dashboard.
 - Grow `scripts/preflight.py` by one check per real incident. It is already the fastest way to tell whether the system actually works, and every check in it was earned by something that broke.
 - Decide whether to move STT/TTS off the browser. Groq serves `whisper-large-v3` on the existing `GROQ_API_KEY` — hosted Whisper with no local model download and no new credential, and the only thing keeping voice Chrome-only.
 
@@ -712,7 +760,6 @@ No API keys, passwords, tokens, or other credentials are included in this docume
 - Real user authentication via Supabase Auth, replacing the single seeded dev user — memory is already scoped by `user_id` throughout, so this is expected to be a drop-in change to `get_current_user_id`.
 
 ### Long-Term
-- Phase 5 — web search tool and document-grounded RAG with citations.
 - Phase 6 — multi-agent orchestration (specialized Research/Memory/Coding agents) with an activity dashboard.
 - Phase 7 — vision (screen understanding) and permissioned computer/application control, with a full audit-log and kill switch.
 - Phase 8 — production deployment, monitoring, and CI/CD.

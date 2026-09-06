@@ -242,6 +242,18 @@ User question → Embed question → Similarity search ────────�
 - **Re-ranking (optional, later):** A lightweight re-ranker to improve top-k quality once basic RAG works.
 - **Citation system:** Track which chunk/document each answer used, and show "Source: filename.pdf, page 4" in the UI — a strong portfolio detail (shows you understand grounding/hallucination mitigation).
 
+### As built (Phase 5)
+
+Built as specified, with three decisions the outline did not cover:
+
+1. **Chunks never span pages.** Packing across a page boundary is more efficient and makes every citation from that chunk a coin flip between two pages. Since the whole point of the citation is that a reader can act on it, the chunker (`app/rag/chunk.py`) splits per page and accepts the waste.
+2. **Chunk sizes are in characters, not tokens.** Counting real tokens would mean shipping a tokeniser for `gemini-embedding-001`, whose tokeniser is not public. ~4 chars/token is the standard approximation, so the window is expressed in characters and named as an approximation rather than pretending to precision.
+3. **Ingestion is a background task, extraction is not.** Embedding a 40-page PDF takes tens of seconds, so upload returns immediately with `status: "pending"`. But extraction runs *in* the request, because it is fast and it is the only way to reject a password-protected or scanned PDF with a 4xx the user can act on — a file accepted now and failed silently later is a much worse experience.
+
+**Tool use is a planner call, not provider function-calling.** Gemini and Groq both support function calling, with incompatible schemas, and `LLMProvider` (Section 4) exists precisely so nothing above it knows which provider answered. `app/tools/planner.py` instead asks the model in plain text which tool to use and gets JSON back. It works on any model, keeps the provider swap a config change, and refuses an unrecognised tool name rather than matching it to the nearest — the same rule as the model registry. The cost is one extra round trip per non-trivial message, which is why small talk is filtered out before the planner is called at all.
+
+**Web search degrades rather than requiring a key.** Tavily is used when `SEARCH_API_KEY` is set; otherwise DuckDuckGo's Instant Answer API, which needs no account. They are not equivalent — the fallback returns encyclopaedic lookups, not ranked web results, and is useless for recent events — so which provider ran is reported in every result. A search tool that quietly answers from a weaker source than the user assumes is how a system earns distrust.
+
 ---
 
 ## 8. Voice Architecture
@@ -435,6 +447,14 @@ notifications
   # both ends locally (Section 8). These endpoints only become necessary if
   # the Whisper/Edge-TTS backend path is taken.
 
+/documents                      # built in Phase 5
+  GET    /documents             # with ingestion status per file
+  POST   /documents             # multipart upload; 201 + status "pending"
+  DELETE /documents/{id}
+
+/tools                          # built in Phase 5
+  GET    /tools                 # name, description, and whether it can run right now
+
 /models                         # built in Phase 4
   GET    /models                # active model + the verified-available list
   POST   /models/active         # {"spoken": "..."} -> pin, or 404 refusal
@@ -594,9 +614,10 @@ ai-assistant/
 
 **Not taken from the source build, and why:** phone calls via Retell and Telegram/Gmail invoice automation are paid services, break the zero-cost constraint, and are Phase 5/7 tool-calling work regardless. Its keyword-overlap retrieval is strictly worse than the `pgvector` search already shipped in Phase 3.
 
-### Phase 5 — Tools & RAG
+### Phase 5 — Tools & RAG ✅ Complete
 
 **Goals:** Web search tool, document upload + RAG with citations.
+**As built:** `app/rag/` (extract → chunk → embed → pgvector, migration `0003_documents` with an HNSW index on `document_chunks.embedding`), `app/tools/` (a `Tool` interface, web search with a keyless fallback, document search, and a provider-agnostic planner), `/documents` and `/tools` APIs, a documents dashboard with live ingestion status, and page-numbered citation chips on replies. See Section 7 for the three design decisions the outline did not cover and why tool use is a planner call rather than provider function-calling. Verified live end-to-end: a real 12-page PDF ingested to 13 passages, and a question whose answer exists only in that file answered correctly with a page citation — `scripts/preflight.py` now proves that chain on every run using a codename no model has ever seen.
 **Deliverables:** Assistant can search the web and answer questions from your uploaded PDFs with sources.
 **Difficulty:** Medium
 
