@@ -538,6 +538,118 @@ async def check_agents(client: httpx.AsyncClient, report: Report) -> None:
         )
 
 
+async def check_automation_safety(client: httpx.AsyncClient, report: Report) -> None:
+    """Phase 7: the permission boundary, verified against the running server.
+
+    Unit tests already prove the guard's logic. What they cannot prove is
+    that the deployed process is enforcing it -- a misconfigured environment,
+    a stale worker, or a route added without the guard would all pass the
+    suite and fail here. These checks assert refusals, because a permission
+    system that has quietly stopped refusing looks exactly like one that is
+    working.
+
+    Nothing here executes a state-changing action. It asserts that they are
+    blocked, which is the only assertion worth making against a real machine.
+    """
+    section("Automation safety")
+
+    try:
+        status = (await client.get("/automation/actions")).json()
+    except (httpx.HTTPError, ValueError) as exc:
+        report.fail("GET /automation/actions", f"{type(exc).__name__}: {exc}")
+        return
+
+    by_name = {a["name"]: a for a in status["actions"]}
+    if {"system_info", "open_url", "open_app"} <= set(by_name):
+        report.ok("GET /automation/actions", f"{len(by_name)} actions")
+    else:
+        report.fail("GET /automation/actions", f"unexpected action list: {sorted(by_name)}")
+        return
+
+    # There must be no way to run a command. This is checked against the
+    # RUNNING server rather than the source, because "the allowlist has no
+    # shell action" and "the deployed process has no shell action" are
+    # different claims.
+    forbidden = {"run", "run_command", "shell", "exec", "eval", "cmd", "powershell"} & set(by_name)
+    if forbidden:
+        report.fail("no arbitrary command action is exposed", f"found {sorted(forbidden)}")
+    else:
+        report.ok("no arbitrary command action is exposed")
+
+    if not status["enabled"]:
+        report.warn(
+            "automation is enabled",
+            "AUTOMATION_ENABLED is off, so nothing can run. That is the safe default; "
+            "the checks below verify it is actually enforced.",
+        )
+        denied = await client.post("/automation/execute", json={"action_name": "system_info"})
+        if denied.status_code == 403:
+            report.ok("the master switch is enforced", "even read-only actions are refused")
+        else:
+            report.fail(
+                "the master switch is enforced",
+                f"automation is off but system_info returned {denied.status_code}",
+            )
+        return
+
+    # Enabled: assert the escalation rule holds against the live server.
+    sensitive = [a for a in status["actions"] if a["risk"] == "sensitive"]
+    if not sensitive:
+        report.warn("a sensitive action exists", "nothing occupies the sensitive tier, so escalation is untested")
+    elif all(a["needs_confirmation"] for a in sensitive):
+        report.ok("sensitive actions always demand confirmation", ", ".join(a["name"] for a in sensitive))
+    else:
+        report.fail(
+            "sensitive actions always demand confirmation",
+            f"{[a['name'] for a in sensitive if not a['needs_confirmation']]} do not",
+        )
+
+    # Approve the category, then assert the sensitive action inside it is
+    # STILL refused. This is the rule most likely to rot silently.
+    target = sensitive[0] if sensitive else None
+    if target:
+        await client.post("/automation/permissions", json={"action_name": target["category"]})
+        attempt = await client.post(
+            "/automation/execute",
+            json={"action_name": target["name"], "arguments": {"app": MARKER}, "confirmed": False},
+        )
+        if attempt.status_code == 403:
+            report.ok("a session grant does not cover a sensitive action", target["name"])
+        else:
+            report.fail(
+                "a session grant does not cover a sensitive action",
+                f"{target['name']} returned {attempt.status_code} after only a category approval",
+            )
+        await client.delete(f"/automation/permissions/{target['category']}")
+
+    # The kill switch, exercised for real: engage, prove a read-only action
+    # is refused, release. Left released whatever happens.
+    try:
+        engaged = (await client.post("/automation/stop")).json()
+        if not engaged["kill_switch_engaged"]:
+            report.fail("the kill switch engages", "STOP returned without engaging")
+        else:
+            blocked = await client.post("/automation/execute", json={"action_name": "system_info"})
+            if blocked.status_code == 403:
+                report.ok("the kill switch halts even read-only actions")
+            else:
+                report.fail(
+                    "the kill switch halts even read-only actions",
+                    f"system_info returned {blocked.status_code} while stopped",
+                )
+    finally:
+        await client.post("/automation/resume")
+
+    log = await client.get("/automation/log")
+    if log.status_code == 200 and any(row["outcome"] in ("denied", "blocked") for row in log.json()):
+        report.ok("refusals are written to the audit log")
+    else:
+        report.fail(
+            "refusals are written to the audit log",
+            "actions were refused above but no denial reached the log",
+        )
+
+
 async def check_model_swap(client: httpx.AsyncClient, report: Report) -> None:
     section("Runtime model swap")
     try:
@@ -646,6 +758,14 @@ async def cleanup(report: Report) -> None:
                 {"pattern": f"%{MARKER.replace('-', '_')}%"},
             )
             removed_runs = result.rowcount or 0
+            # Permission grants made by the safety checks. The activity_logs
+            # rows they produced are deliberately NOT deleted: an audit log
+            # that a test run can erase is not an audit log.
+            result = await session.execute(
+                text("DELETE FROM permissions WHERE user_id = :uid AND action_name IN ('apps', 'browse')"),
+                {"uid": get_settings().dev_user_id},
+            )
+            removed_grants = result.rowcount or 0
             result = await session.execute(
                 text(
                     "DELETE FROM conversations WHERE id IN ("
@@ -668,7 +788,8 @@ async def cleanup(report: Report) -> None:
         report.ok(
             "test data removed",
             f"{removed_memories} memories, {removed_documents} documents, "
-            f"{removed_runs} agent runs, {removed_conversations} conversations",
+            f"{removed_runs} agent runs, {removed_grants} grants, "
+            f"{removed_conversations} conversations (audit log kept)",
         )
     except Exception as exc:  # noqa: BLE001
         report.warn("test data removed", f"{type(exc).__name__}: {exc} -- check the dashboard for stray rows")
@@ -697,6 +818,7 @@ async def main(all_models: bool, skip_llm: bool) -> int:
             await check_memory_graph(client, report)
             await check_tools_and_rag(client, report)
             await check_agents(client, report)
+            await check_automation_safety(client, report)
             await check_model_swap(client, report)
             await cleanup(report)
         print(f"\nfinished in {time.monotonic() - started:.1f}s")

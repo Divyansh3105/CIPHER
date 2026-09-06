@@ -16,6 +16,15 @@ os.environ.setdefault("DATABASE_URL", "postgresql://test:test@localhost:5432/tes
 os.environ.setdefault("GEMINI_API_KEY", "test-gemini-key")
 os.environ.setdefault("GROQ_API_KEY", "test-groq-key")
 
+# Assignment, not setdefault: automation settings now fall back to .env
+# (app/automation/actions.py explains why), and a developer who has switched
+# automation on for real must not thereby change what the test suite is
+# testing. Pinned off here so every test starts from the safe default and
+# opts in explicitly.
+os.environ["AUTOMATION_ENABLED"] = "false"
+os.environ["AUTOMATION_ALLOWED_DIRS"] = ""
+os.environ["AUTOMATION_ALLOWED_APPS"] = ""
+
 import pytest
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import delete, select
