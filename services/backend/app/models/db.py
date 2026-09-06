@@ -1,13 +1,16 @@
-"""SQLAlchemy ORM models: users, conversations, messages, memories (Phase 3).
+"""SQLAlchemy ORM models.
 
-Later phases add `documents`/`document_chunks`, `tasks`, `agents`/
-`agent_runs`, `tools`, `permissions`, and `activity_logs` (see
-docs/architecture.md, Section 12) -- deliberately not created yet.
+users, conversations, messages (Phase 1); memories (Phase 3); documents and
+document_chunks (Phase 5).
+
+Later phases add `tasks`, `agents`/`agent_runs`, `tools`, `permissions`, and
+`activity_logs` (see docs/architecture.md, Section 12) -- deliberately not
+created yet.
 """
 import uuid
 from datetime import datetime
 
-from sqlalchemy import DateTime, ForeignKey, Index, JSON, String, Text, Uuid, func, text
+from sqlalchemy import DateTime, ForeignKey, Index, Integer, JSON, String, Text, Uuid, func, text
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -76,10 +79,93 @@ class Message(Base):
         PgJson, nullable=False, default=list, server_default=text("'[]'")
     )
 
+    # Phase 5: what grounded this reply. Either document chunks
+    # ({"kind": "document", "document_id", "filename", "page_number",
+    # "content", "similarity"}) or web results ({"kind": "web", "title",
+    # "url", "snippet"}). A snapshot for the same reason as
+    # recalled_memories: a citation must keep saying what the answer was
+    # actually based on, even after the document is deleted or the page
+    # changes. Only ever populated on assistant messages.
+    citations: Mapped[list] = mapped_column(
+        PgJson, nullable=False, default=list, server_default=text("'[]'")
+    )
+
     conversation: Mapped["Conversation"] = relationship(back_populates="messages")
 
     __table_args__ = (
         Index("ix_messages_conversation_id", "conversation_id"),
+    )
+
+
+class Document(Base):
+    """An uploaded file, chunked and embedded for retrieval (Phase 5).
+
+    `status` is the honest bit of this table. Ingestion happens in the
+    background, so a document exists before it is searchable, and the UI has
+    to be able to say which. "failed" carries `error` rather than leaving a
+    file that silently never answers anything.
+    """
+
+    __tablename__ = "documents"
+
+    id: Mapped[uuid.UUID] = mapped_column(PgUuid, primary_key=True, default=uuid.uuid4)
+    user_id: Mapped[uuid.UUID] = mapped_column(PgUuid, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    filename: Mapped[str] = mapped_column(String(260), nullable=False)
+    content_type: Mapped[str] = mapped_column(String(120), nullable=False)
+    size_bytes: Mapped[int] = mapped_column(Integer, nullable=False)
+    # sha256 of the extracted text, so re-uploading the same file is a no-op
+    # rather than a second copy competing with the first in every retrieval.
+    content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    #: "pending" | "ready" | "failed"
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="pending")
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    chunk_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    page_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    chunks: Mapped[list["DocumentChunk"]] = relationship(
+        back_populates="document", cascade="all, delete-orphan", order_by="DocumentChunk.chunk_index"
+    )
+
+    __table_args__ = (
+        Index("ix_documents_user_id", "user_id"),
+        Index("ix_documents_user_content_hash", "user_id", "content_hash", unique=True),
+    )
+
+
+class DocumentChunk(Base):
+    """One retrievable passage of a document.
+
+    `user_id` is denormalised from `documents` on purpose: retrieval scopes
+    by user on every similarity query, and doing that through a join would
+    stop the HNSW index answering the ORDER BY on its own.
+    """
+
+    __tablename__ = "document_chunks"
+
+    id: Mapped[uuid.UUID] = mapped_column(PgUuid, primary_key=True, default=uuid.uuid4)
+    document_id: Mapped[uuid.UUID] = mapped_column(
+        PgUuid, ForeignKey("documents.id", ondelete="CASCADE"), nullable=False
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(PgUuid, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    chunk_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    #: None for formats that have no pages (plain text, Markdown).
+    page_number: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    # Same NOTE as Memory.embedding below: deferred is load-bearing, not an
+    # optimisation. asyncpg has no codec for `vector`.
+    embedding: Mapped[list[float] | None] = mapped_column(
+        Embedding(MEMORY_EMBEDDING_DIM), nullable=True, deferred=True
+    )
+
+    document: Mapped["Document"] = relationship(back_populates="chunks")
+
+    __table_args__ = (
+        Index("ix_document_chunks_document_id", "document_id"),
+        Index("ix_document_chunks_user_id", "user_id"),
     )
 
 
