@@ -167,6 +167,15 @@ All three personas share **one underlying LLM** (or a small set of models via th
 
 **Fallback system:** If the primary provider errors or rate-limits, automatically retry with the fast/cheap model or a secondary free provider, and tell the user "falling back to a lighter model" rather than failing silently.
 
+**As built (Phase 4) — runtime model pin, and the one place fallback is wrong.** `LLMRouter` now accepts a runtime *pin*: the user can name a model mid-conversation, by voice or from a chip in the header, and it takes effect immediately (`app/llm/registry.py`, `app/api/models.py`). Two rules keep it honest, and both are deliberate departures from the paragraph above:
+
+- **A pinned model never falls back.** Automatic fallback is right for default routing — an answer beats an outage. It is wrong the moment the user names a model, because the entire reason to name one is knowing which one answered. A pinned model that fails returns HTTP 409 naming it, rather than a silent answer from a different model.
+- **Model names resolve by exact alias only, and near-misses are refused.** No fuzzy matching, no "did you mean". Saying "gemini 4 flash" must fail loudly rather than land on 3.8 and announce success. The refusal carries the list of models that do exist, so recovery takes one retry.
+
+Every model in the registry is verified by a **real generate call** against the project's own keys (`scripts/verify_models.py`), never taken from the provider's model list. That distinction is load-bearing: on this project's Gemini key, `client.models.list()` advertises `gemini-2.5-pro` and `gemini-2.5-flash-lite`, and a real call to either returns 404 "no longer available". A registry built from the list endpoint would have shipped two models that cannot answer.
+
+Note that the model IDs named in the table above (Gemini 2.5 Flash, Llama 3.3 70B, Llama 3.1 8B) are all now **gone** from this account's providers — see `app/llm/gemini.py` and `app/llm/groq.py` for what replaced them. Treat any model ID written in this document as a snapshot, not a fact.
+
 ---
 
 ## 5. Multi-Agent Architecture (Phase 6+ — Post-MVP)
@@ -256,6 +265,33 @@ Microphone → Wake Word Detection → Voice Activity Detection → Speech-to-Te
 **Latency expectations for a beginner project:** Aim for under ~2-3 seconds end-to-end for MVP (not true real-time like commercial assistants) — this is a very reasonable target and still feels responsive.
 
 **Offline basics:** Since Whisper and wake-word detection can run locally, basic voice input can work offline even in the MVP; only the LLM reasoning step needs internet (unless you add a local model later).
+
+### As built (Phase 4) — browser-first, with the local path kept open
+
+The shipped voice loop uses the **browser's own Web Speech API** in both directions, not the Whisper + Edge-TTS stack in the table above. This is a sequencing decision, not a reversal:
+
+| | Table above (Whisper + Edge-TTS) | Shipped first (Web Speech API) |
+| --- | --- | --- |
+| Cost | Free | Free |
+| Setup | Model download, audio pipeline, ffmpeg | None |
+| Browser support | Any | **Chrome/Edge only** |
+| Privacy | Local, offline-capable | **Audio goes to Google's servers** |
+| Latency | Depends on local CPU | Near-instant |
+
+The privacy and browser-support columns are real costs, and the reason this is acceptable is that `apps/web/src/lib/speech.ts` is the **only** module that touches the API — the same containment trick `LLMProvider` uses. Swapping in a Whisper/Edge-TTS backend later means adding a second implementation behind that surface, not rewriting the UI.
+
+**Three things learned building it that the table does not capture:**
+
+1. **The finish window is the whole feature.** Speech recognition finalises a phrase on every pause, and people pause mid-sentence. Dispatching on the first final result truncates roughly every other utterance. Final results are buffered and a timer restarts on each one; only a pause outlasting `FINISH_MS` (900ms, one named constant) ends the thought. This value is personal and should be tuned after a day of real use, not guessed at in one sitting.
+2. **The assistant hears itself.** With speakers on, the recogniser transcribes the TTS output and the assistant answers its own last sentence. The mic is aborted for the duration of playback and restarted afterwards.
+3. **Interrupt words are controls, not messages.** A bare "stop" cancels playback and is never sent to the model; "stop" inside a sentence stays an ordinary word.
+
+**Wake word — not required, and Picovoice is not the only option.** Porcupine needs an account (its signup asks for a work email on some flows). Two keyless alternatives, either of which is preferable to being blocked on a signup form:
+
+- **Match the phrase in the transcript.** Recognition already streams text continuously, so "hey cipher" can be detected client-side with no new dependency and no account.
+- **openWakeWord** (MIT) runs a local ONNX model in Python — no signup, no key, fully offline.
+
+**A third STT option found while auditing model availability:** Groq serves `whisper-large-v3` and `whisper-large-v3-turbo` on the `GROQ_API_KEY` this project already has. That is hosted Whisper with no local model download and no new credential — likely a better second step than local Whisper if the browser API's constraints start to bite.
 
 ---
 
@@ -395,6 +431,14 @@ notifications
 /voice
   POST   /voice/transcribe      # audio in -> text out
   POST   /voice/synthesize      # text in -> audio out
+  # NOT BUILT, and not needed by the shipped voice loop: the browser does
+  # both ends locally (Section 8). These endpoints only become necessary if
+  # the Whisper/Edge-TTS backend path is taken.
+
+/models                         # built in Phase 4
+  GET    /models                # active model + the verified-available list
+  POST   /models/active         # {"spoken": "..."} -> pin, or 404 refusal
+  DELETE /models/active         # back to default routing
 
 /agents
   GET    /agents
@@ -523,12 +567,27 @@ ai-assistant/
 **Difficulty:** Medium
 **As built:** `memories` table with a real `vector(768)` column (`gemini-embedding-001`) and HNSW cosine index on Supabase; hybrid capture (deterministic "remember that…" detection plus a background LLM extraction pass, run via `BackgroundTasks` after the reply is sent so it adds no latency); retrieval wired into every chat reply with a live-tuned similarity threshold and per-persona framing (still one shared store, per this doc's Section 3); a `/memory` dashboard with GET/POST/PATCH/DELETE (PATCH added beyond Section 13's original GET/POST/DELETE, for the edit control Section 6 calls for). See `README.md` Section 5, Phase 3 for the full writeup including live-verification results and the two thresholds tuned by `scripts/memory_golden_set.py`.
 
-### Phase 4 — Voice
+### Phase 4 — Voice (in progress)
 
 **Goals:** Add STT/TTS, wake word, push-to-talk.
 **Technologies:** Whisper, Edge-TTS, Porcupine/openWakeWord.
 **Deliverables:** You can talk to the assistant and hear it respond, in your chosen persona's voice.
 **Difficulty:** Medium–Hard
+
+**Scope change.** Phase 4 picked up two workstreams that are not in this blueprint. Both came from studying a public "build your own JARVIS" build (Zubair Trabzada, AI Workshop, September 2026) and taking only the parts CIPHER did not already do better. That build's retrieval is keyword overlap over local markdown files and its persistence is a folder on one machine, so its brain and its memory were not worth copying — but its feature surface and its verification discipline were. The two additions are marked NEW below.
+
+**Done:**
+
+1. **Voice loop, both directions** — browser Web Speech API (Section 8 records why this ships before Whisper/Edge-TTS, and what it costs). `FINISH_MS` pause buffering, a listening/thinking/speaking/dropped status line, per-persona voice profiles, markdown stripped before speaking, the mic muted during playback, and bare interrupt words treated as controls rather than messages. Files: `apps/web/src/lib/speech.ts`, `src/hooks/useVoice.ts`, `src/components/VoiceControls.tsx`.
+2. **Runtime model swap with honest refusal** — pin a model mid-conversation by voice or from a header chip; near-miss names are refused rather than resolved to the nearest match; a pinned model never falls back (Section 4). Files: `app/llm/registry.py`, `app/llm/router.py`, `app/api/models.py`, `scripts/verify_models.py`, `apps/web/src/components/ModelChip.tsx`.
+
+**Remaining:**
+
+3. **NEW — `preflight.py`, a live-chain harness.** Not unit tests and not mocks: real calls against a running system, printing a tick or a cross per chain and exiting non-zero on any failure. The 157-test suite proves the units work against fakes; it cannot catch the failures that have actually cost this project time, every one of which was live-only — a stale `uvicorn` serving pre-retrieval code (Phase 3, Challenge 4), a Supavisor pooler rejecting prepared statements (Phase 1), a model ID silently deprecated by the provider (Phase 1). Planned checks: backend up; frontend reachable; Alembic at head; a real Gemini chat call; a real embedding round trip; `POST /chat/message` returning a well-formed reply carrying `recalled_memories`; a memory written and retrievable by the very next question; every registry model reachable; `.env` not reachable from the browser. The rule to adopt alongside it: **"done" means preflight passed, not that the code looks right** — and add one check per real incident, so the file grows into the most valuable one in the repo.
+4. **NEW — 3D memory galaxy.** Render the `memories` table as a force-directed graph (nodes = memories, links = embedding similarity above a threshold, colour = `memory_type`), and fly the camera to the memory a reply actually used. The data already exists and is already better than the source build's: real 768-dimension vectors with an HNSW index, and every reply already persists a snapshot of what it recalled (`messages.recalled_memories`). Today that snapshot renders as a text chip; this makes it visible. Needs a `GET /memory/graph` endpoint computing pairwise similarity server-side, plus a graph view on the existing `/memory` page.
+5. **Wake word** — optional, and deliberately last. See Section 8: no paid key is required, and the transcript-matching approach needs no new dependency at all.
+
+**Not taken from the source build, and why:** phone calls via Retell and Telegram/Gmail invoice automation are paid services, break the zero-cost constraint, and are Phase 5/7 tool-calling work regardless. Its keyword-overlap retrieval is strictly worse than the `pgvector` search already shipped in Phase 3.
 
 ### Phase 5 — Tools & RAG
 

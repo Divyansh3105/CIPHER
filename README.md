@@ -48,7 +48,7 @@ Rather than exposing one fixed assistant personality, CIPHER lets the user switc
 - Multi-agent orchestration (research, memory, coding agents)
 - Permissioned computer/automation control with a kill switch and audit log
 
-**Current status:** Phase 0 (planning and scaffolding) is complete. Phase 1 (single-persona core MVP chat) is complete and verified live — real messages sent through the UI are persisted in Postgres and answered by Gemini, with an automatic Groq fallback. Phase 2 (the JARVIS/FRIDAY/ULTRON personality system, with a per-message switcher and ULTRON's safety filter) is also complete and verified live. Phase 3 (long-term memory via `pgvector`, hybrid capture, and a memory dashboard) is complete and verified live as well (see [Section 6](#6-current-project-status)). The full phase-by-phase design lives in [`docs/architecture.md`](docs/architecture.md).
+**Current status:** Phase 0 (planning and scaffolding) is complete. Phase 1 (single-persona core MVP chat) is complete and verified live — real messages sent through the UI are persisted in Postgres and answered by Gemini, with an automatic Groq fallback. Phase 2 (the JARVIS/FRIDAY/ULTRON personality system, with a per-message switcher and ULTRON's safety filter) is also complete and verified live. Phase 3 (long-term memory via `pgvector`, hybrid capture, and a memory dashboard) is complete and verified live as well. Phase 4 is **in progress**: a browser-native voice loop and a runtime model swap are built and verified live, while a `preflight.py` live-chain harness, a 3D memory galaxy, and wake-word detection are still outstanding (see [Section 6](#6-current-project-status)). The full phase-by-phase design lives in [`docs/architecture.md`](docs/architecture.md).
 
 ---
 
@@ -102,11 +102,12 @@ Rather than exposing one fixed assistant personality, CIPHER lets the user switc
 | AI/ML | Google Gemini (`gemini-3.6-flash`) via `google-genai`; Groq (`openai/gpt-oss-120b`) via `groq` | Primary and automatic-fallback response generation |
 | Vector memory | `pgvector` extension on Supabase Postgres; `gemini-embedding-001` (768 dims) via `google-genai` | Long-term memory storage and similarity search (Phase 3) — no new Python dependency, since embeddings go through the same `google-genai` client already used for chat |
 | Authentication | Supabase Auth — **planned, not yet implemented** | Phase 1 uses a single seeded dev user instead (see [Section 5](#5-development-phases)) |
+| Voice | Browser Web Speech API (`webkitSpeechRecognition`, `speechSynthesis`) | Speech in and out, Phase 4 — zero dependencies and zero cost, but Chrome/Edge-only and recognition audio goes to Google; contained in `apps/web/src/lib/speech.ts` so a Whisper/Edge-TTS backend can slot in behind it |
 | Testing | pytest, pytest-asyncio, httpx, aiosqlite | Backend unit + integration tests, run against an in-memory DB |
 | Deployment | **Not yet configured.** Planned: Vercel (frontend) + Render/Railway (backend) + Supabase (DB), per `docs/architecture.md` Section 19 | — |
 | Other | ESLint (`eslint-config-next`), Turbopack (via `next dev`) | Linting; dev-server bundling |
 
-Only technologies actually present in the codebase or `requirements.txt`/`package.json` are listed above. Whisper, Edge-TTS, and LangGraph appear in the target architecture doc for later phases but are not yet dependencies of this project.
+Only technologies actually present in the codebase or `requirements.txt`/`package.json` are listed above. Note that the voice row adds **no dependency at all** — it is browser API surface, not a package. Whisper, Edge-TTS, and LangGraph appear in the target architecture doc and remain candidates for later, but are not dependencies of this project today.
 
 ---
 
@@ -343,13 +344,69 @@ Only technologies actually present in the codebase or `requirements.txt`/`packag
 
 **Objective:** Add speech-to-text and text-to-speech, wake-word detection, and push-to-talk, so each persona has a distinct voice.
 
-**What Was Done:** Not yet started.
+**Scope note:** Two workstreams were added to this phase after studying a public "build your own JARVIS" project (Zubair Trabzada, AI Workshop, September 2026) and comparing it against what CIPHER already had. That build's retrieval is keyword overlap over local markdown and its persistence is a folder on one machine, so its brain and its memory were not worth copying — CIPHER's `pgvector` search is strictly better. Its *feature surface* and its *verification discipline* were worth taking: a runtime model swap, and a live-chain preflight harness. Its paid pieces (Retell phone calls, Telegram/Gmail invoice automation) were rejected as out of budget and out of phase. See `docs/architecture.md` Section 16 for the full comparison.
 
-**Challenges Faced:** None — not yet started.
+**What Was Done:**
 
-**How the Challenges Were Overcome:** Not applicable.
+*Voice loop (frontend only — the browser does both ends):*
+- `apps/web/src/lib/speech.ts` — the single module that touches the Web Speech API, so a later Whisper/Edge-TTS backend becomes a second implementation behind the same surface rather than a UI rewrite
+- **`FINISH_MS` pause buffering (900ms)** — recognition finalises a phrase on every pause, and people pause mid-sentence, so dispatching on the first final result truncates roughly every other utterance. Final results are buffered and the timer restarts on each one; only a pause that outlasts the window ends the thought
+- Echo suppression — the mic is aborted for the duration of playback, because with speakers on the recogniser otherwise transcribes the assistant's own voice and it answers its own last sentence
+- Interrupt words as controls — a bare "stop" cancels playback and is never sent to the model, while "stop" inside a sentence stays an ordinary word
+- Per-persona voice profiles (`VOICE_PROFILES` in `src/lib/personas.ts`), markdown stripped before speaking (a fenced code block read aloud is unlistenable; it says "the code is on screen" instead), and a listening/thinking/speaking/dropped status line, since in a voice loop nothing on screen otherwise tells you whose turn it is
+- Graceful degradation: an unsupported browser shows a plain message and everything still works by typing
 
-**Phase Status:** ⏳ Planned
+*Runtime model swap (backend and frontend):*
+- `app/llm/registry.py` — an explicit allowlist of models mapped from spoken names, resolved by **exact alias only**. A near miss such as "gemini 4 flash" is refused with the list of models that do exist, never resolved to the nearest match
+- `app/llm/router.py` — a process-lifetime pin. **A pinned model never falls back**: automatic Gemini-to-Groq fallback is right for default routing but wrong once the user has named a model, because the entire reason to name one is knowing which one answered. A pinned failure returns HTTP 409 naming the model
+- `app/api/models.py` — `GET /models`, `POST /models/active` (which takes what the user *said*, not an ID), `DELETE /models/active`
+- `scripts/verify_models.py` — proves every registry entry with a real generate call against the project's own keys
+- `apps/web/src/components/ModelChip.tsx` — the active model shown in the header, plus a spoken command path ("switch to Qwen", "change to FRIDAY", "go back to your normal brain") routing persona names to the persona switcher and model names to the registry
+
+*Testing performed:*
+- 55 new backend tests (alias resolution, near-miss refusal, reset phrases, registry integrity, the pin's no-fallback rule, the `/models` endpoints, and a 409 when a pinned model fails) — full suite **157/157 passing**, still with no live credentials needed
+- 16 logic checks on the transcript buffer and the speakable-text normaliser, compiled from the shipped source and run in Node
+- The two spoken-command regexes extracted from the shipped page component and verified against a case table, after two escaping bugs were found in them
+- A live browser integration run driving the real app with a scripted recogniser: two fragments 400ms apart merged into one message; a real Gemini reply spoken with markdown stripped at the JARVIS profile's rate; the mic aborted during playback and restarted after; a bare "stop" cancelling speech without being sent; the mic switch flushing a half-finished thought
+- A live model-swap run: the chip moved from Auto to Qwen, a real chat message actually answered on `qwen/qwen3.8-27b` with `fell_back: false`, and `"switch to gemini 4 flash"` returned 404 naming all seven real models without disturbing the existing pin
+- Frontend typechecks and lints clean
+
+**Challenges Faced:**
+1. The Web Speech API finalises a phrase on every pause, including pauses in the middle of a sentence.
+2. With speakers on, the recogniser hears the assistant's own text-to-speech output.
+3. A provider's model list is not evidence that a model can actually be called.
+4. Speech arriving while a reply was still in flight was being dropped silently.
+5. The mic button lit up during ordinary typed conversations.
+
+**How the Challenges Were Overcome:**
+
+**Challenge 1 — mid-sentence pauses truncate utterances.**
+**Solution:** Buffered every final result and restarted a single named timer (`FINISH_MS`) on each one, so only the pause that outlasts it dispatches the combined sentence. The value lives in one constant at the top of the file so it can be tuned from real use rather than re-guessed.
+**Result:** Verified live in the running app — two fragments 400ms apart arrived as one message, and nothing was sent during the gap.
+
+**Challenge 2 — the assistant hears itself.**
+**Solution:** The mic is `abort()`ed when speech synthesis starts, not `stop()`ed — `stop()` delivers a final result for whatever the mic just heard, which is the assistant's own voice — and restarted when playback ends or is cancelled.
+**Result:** Verified live: an abort was recorded at the moment the reply began speaking, and recognition restarted afterwards.
+
+**Challenge 3 — the model list lies.**
+**Solution:** Built the registry only from models proven by a real generate call, and wrote `scripts/verify_models.py` to keep it honest.
+**Result:** Caught two models that would otherwise have shipped. `client.models.list()` advertises `gemini-2.5-pro` and `gemini-2.5-flash-lite`, and a real call to either returns 404 "no longer available". A third, `gemini-3.1-pro-preview`, exists but returns 429 on the free tier and was excluded for the same reason: a model the user can name but cannot reach is worse than one never offered.
+
+**Challenge 4 — speech dropped silently while a reply was in flight.**
+**Solution:** Kept the drop, since queueing would send a stale message minutes later, but surfaced it — the status line now reads "Didn't catch that, JARVIS was still answering". The dropped state deliberately outranks "thinking", because the reply in flight is the *reason* it was dropped, and reporting "thinking" would leave you waiting for an answer to a question that was never sent.
+**Result:** Found only by driving the live app; the unit tests could not have surfaced it.
+
+**Challenge 5 — the mic button reflected the wrong thing.**
+**Solution:** Its on/off state was being derived from the voice state machine, and "thinking"/"speaking" occur when typing too. It now takes the mic switch as an explicit prop.
+**Result:** Verified: typing a message leaves the button reading "Turn the microphone on" with `aria-pressed="false"`.
+
+**What Remains:**
+- **`preflight.py`** — a live-chain harness making real calls against a running system and exiting non-zero on any failure (backend up, Alembic at head, a real Gemini call, a real embedding round trip, chat returning `recalled_memories`, a memory retrievable by the very next question, every registry model reachable, `.env` not reachable from the browser). Every failure that has cost this project time was live-only and invisible to the unit tests — see Phase 1's model-ID and pooler issues and Phase 3's Challenge 4.
+- **3D memory galaxy** — the `memories` table as a force-directed graph, with the camera flying to the memory a reply actually used. Needs `GET /memory/graph` plus a graph view on the existing `/memory` page. The recalled-memory snapshot that already backs the text chips is the data source.
+- **Wake word** — optional and last. No paid key needed: matching "hey cipher" in the transcript stream needs no new dependency, and openWakeWord (MIT) runs locally with no account.
+- **A decision to revisit:** whether to move STT/TTS off the browser. Groq serves `whisper-large-v3` on the `GROQ_API_KEY` this project already has, which is hosted Whisper with no local model download and no new credential.
+
+**Phase Status:** 🚧 In progress — the voice loop and the runtime model swap are built and verified live; the preflight harness, the memory galaxy, and the wake word are outstanding.
 
 ---
 
@@ -417,7 +474,7 @@ Only technologies actually present in the codebase or `requirements.txt`/`packag
 | Phase 1 | Core MVP — single-persona (JARVIS) text chat | ✅ Completed |
 | Phase 2 | Personality System (FRIDAY, ULTRON, switcher) | ✅ Completed |
 | Phase 3 | Memory (vector search, memory dashboard) | ✅ Completed |
-| Phase 4 | Voice (STT/TTS, wake word) | ⏳ Planned |
+| Phase 4 | Voice (STT/TTS, wake word) + runtime model swap | 🚧 In progress |
 | Phase 5 | Tools & RAG (web search, documents) | ⏳ Planned |
 | Phase 6 | Multi-Agent System | ⏳ Planned |
 | Phase 7 | Advanced Features (vision, computer control) | ⏳ Planned |
@@ -430,7 +487,10 @@ Only technologies actually present in the codebase or `requirements.txt`/`packag
 - A CORS bug and a stale-LLM-model-ID issue from Phase 1, plus a persona-blind history replay bug and a stale-`updated_at` bug found while building Phase 2, were all only visible under live conditions and are documented with their fixes in [Section 5](#5-development-phases).
 - Long-term memory (Phase 3) is complete and verified: a real `pgvector` column and HNSW index on Supabase; hybrid capture (explicit "remember that…" detection plus background LLM extraction) that adds no user-visible latency; retrieval wired into every chat reply with a live-tuned similarity threshold; a `/memory` dashboard for viewing, editing, and deleting what's stored; and "recalled" chips on chat replies that survive a reload. The backend test suite passes (102/102), a golden-set script tuned both similarity thresholds against real Gemini embeddings, and a live end-to-end walkthrough (real Supabase writes, real recall in a real chat reply, real background capture) is documented in [Section 5](#5-development-phases).
 
-Phases 4 through 8 have not been started; their objectives above are drawn directly from `docs/architecture.md`.
+- Phase 4 is **in progress**. Two of its slices are built and verified live: a browser-native voice loop (click the mic, talk, hear the reply in the active persona’s voice) and a runtime model swap (pin any of seven verified models mid-conversation, from a header chip or by saying “switch to Qwen”). The backend suite is at 157/157. Still outstanding in this phase: a `preflight.py` live-chain harness, the 3D memory galaxy, and wake-word detection — see [Section 5](#5-development-phases), “What Remains”.
+- Two decisions worth knowing about, both documented in `docs/architecture.md`: the voice loop ships on the **browser Web Speech API** rather than the blueprint’s Whisper + Edge-TTS (free and instant, but Chrome/Edge-only and audio goes to Google — contained in one module so the local path stays open), and a **pinned model deliberately never falls back**, because the reason to name a model is knowing which one answered.
+
+Phases 5 through 8 have not been started; their objectives above are drawn directly from `docs/architecture.md`.
 
 ---
 
@@ -503,11 +563,16 @@ flowchart LR
 - [x] Memory recall wired into every chat reply, framed per persona, with a live-tuned similarity threshold
 - [x] `/memory` dashboard — view, edit, delete individual memories, and a confirmed "Forget everything"
 - [x] "Recalled" chips on chat replies that persist across a reload
-- [x] Backend automated test suite (102 tests, in-memory database, no live credentials needed)
+- [x] Voice input and output in the browser — mic button, pause-tolerant transcription (`FINISH_MS`), spoken replies in each persona’s voice, echo suppression while speaking, and “stop” as a spoken interrupt
+- [x] Runtime model swap — pin any of seven live-verified models mid-conversation from a header chip or by voice, with unknown names refused rather than resolved to the nearest match, and no silent fallback while pinned
+- [x] `scripts/verify_models.py` — proves every offered model answers a real call, which caught two that the provider’s own model list advertises but 404s on
+- [x] Backend automated test suite (157 tests, in-memory database, no live credentials needed)
 
 ### Planned
 - [ ] Real user authentication via Supabase Auth
-- [ ] Voice input/output per persona (Phase 4)
+- [ ] `preflight.py` — live end-to-end chain checks against a running system (Phase 4)
+- [ ] 3D memory galaxy — the memory store as a force-directed graph, with the camera flying to the memory a reply used (Phase 4)
+- [ ] Wake-word detection (Phase 4, optional — no paid key required)
 - [ ] Web search tool and document RAG with citations (Phase 5)
 - [ ] Multi-agent orchestration (Phase 6)
 - [ ] Vision and permissioned computer control (Phase 7)
@@ -592,7 +657,7 @@ All variables are read from a single repo-root `.env` file (see `.env.example` f
 | `GEMINI_API_KEY` | Google Gemini API key (primary LLM, and embeddings for long-term memory) | **Yes** |
 | `GROQ_API_KEY` | Groq API key (fallback LLM) | **Yes** |
 | `SEARCH_API_KEY` | Web search provider key | No — reserved for Phase 5 |
-| `PICOVOICE_ACCESS_KEY` | Wake-word detection key | No — reserved for Phase 4 |
+| `PICOVOICE_ACCESS_KEY` | Wake-word detection key | No — and not needed even for Phase 4. The shipped voice loop uses the browser (no key); wake word is optional and has two keyless alternatives, see `.env.example` |
 | `JWT_SECRET_KEY` | Session/JWT signing secret | No — not yet used |
 | `SESSION_SECRET` | Session signing secret | No — not yet used |
 
@@ -603,8 +668,11 @@ No API keys, passwords, tokens, or other credentials are included in this docume
 ## 12. Future Roadmap
 
 ### Short-Term
-- Commit and tag the Phase 3 milestone.
-- Begin Phase 4 — voice input/output, wake-word detection, per-persona voices.
+- Finish Phase 4. The voice loop and the runtime model swap are done; what remains is:
+  1. `preflight.py` — a live-chain harness that makes real calls against a running system and exits non-zero on any failure. This is the highest-value item on the list: every bug that has actually cost this project time was live-only and invisible to the unit suite.
+  2. The 3D memory galaxy — render the `memories` table as a force-directed graph and fly the camera to the memory a reply actually used.
+  3. Wake-word detection — optional, no paid key required.
+- Decide whether to move STT/TTS off the browser. Groq serves `whisper-large-v3` on the existing `GROQ_API_KEY`, which is hosted Whisper with no local model download and no new credential.
 
 ### Medium-Term
 - Real user authentication via Supabase Auth, replacing the single seeded dev user — memory is already scoped by `user_id` throughout, so this is expected to be a drop-in change to `get_current_user_id`.
