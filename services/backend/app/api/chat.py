@@ -24,6 +24,9 @@ from app.models.schemas import (
     MessageOut,
 )
 from app.personas import PERSONAS, build_system_prompt, get_persona
+from app.tools.base import ToolError
+from app.tools.planner import ToolPlan, ToolPlanner
+from app.tools.registry import ToolRegistry, get_tool_registry
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +46,12 @@ TITLE_MAX_LEN = 60
 MEMORY_TOP_K = 5
 MEMORY_MIN_SIMILARITY = 0.65
 MEMORY_MAX_CHARS = 1200
+
+# Phase 5: tool use. The planner runs before the reply, so a message that
+# needs a tool costs two LLM round trips plus the tool call. That is the
+# price of provider-agnostic tool use (app/tools/planner.py explains why
+# function-calling was not used), and it is why the planner short-circuits
+# small talk before spending anything.
 
 
 async def _get_owned_conversation(session: AsyncSession, conversation_id: UUID, user_id: UUID) -> Conversation:
@@ -80,6 +89,7 @@ async def send_message(
     embedder: Embedder = Depends(get_embedder),
     memory_store: MemoryStore = Depends(get_memory_store),
     memory_writer: MemoryWriter = Depends(get_memory_writer),
+    tool_registry: ToolRegistry = Depends(get_tool_registry),
     session_factory: async_sessionmaker = Depends(get_session_factory),
 ) -> ChatMessageResponse:
     if payload.conversation_id is not None:
@@ -141,7 +151,48 @@ async def send_message(
         recalled_snapshot.append({"id": str(hit.id), "content": content, "similarity": hit.similarity})
         budget -= len(content)
 
-    system_prompt = build_system_prompt(persona, mixed_history=mixed_history, recalled_memories=recalled_contents)
+    # --- Tool use (Phase 5) -------------------------------------------
+    #
+    # Failures here are deliberately non-fatal. A search provider being down
+    # is a worse answer, not no answer, so the reply proceeds ungrounded and
+    # the UI reports what was attempted. The one thing that must not happen
+    # is answering *as if* a tool had run -- hence tool_summary carrying the
+    # failure into the response rather than being swallowed.
+    tool_context = ""
+    tool_summary = ""
+    tool_used: str | None = None
+    citations: list[dict] = []
+
+    offered = await tool_registry.available_for(session, user_id=user_id)
+    plan: ToolPlan = await ToolPlanner(llm_router).plan(payload.content, offered)
+
+    if plan.tool_name:
+        tool = tool_registry.get(plan.tool_name)
+        if tool is not None:
+            try:
+                result = await tool.run(plan.query, session=session, user_id=user_id)
+            except ToolError as exc:
+                logger.warning("Tool %s failed: %s", plan.tool_name, exc)
+                tool_summary = f"{plan.tool_name} failed: {exc}"
+            except Exception as exc:  # noqa: BLE001
+                # A tool is the least trustworthy code in the request path --
+                # it talks to the network and to third-party JSON. It must
+                # not be able to take the whole reply down with it.
+                logger.exception("Tool %s raised unexpectedly", plan.tool_name)
+                tool_summary = f"{plan.tool_name} failed unexpectedly ({type(exc).__name__})"
+            else:
+                tool_used = plan.tool_name
+                tool_context = result.context
+                tool_summary = result.summary
+                citations = result.citations
+
+    system_prompt = build_system_prompt(
+        persona,
+        mixed_history=mixed_history,
+        recalled_memories=recalled_contents,
+        tool_context=tool_context,
+        tool_summary=tool_summary,
+    )
     llm_messages = [LLMMessage(role="system", content=system_prompt)]
     llm_messages += [
         LLMMessage(role=m.role, content=_label_for_history(m, persona.id)) for m in history
@@ -183,6 +234,9 @@ async def send_message(
         # reply's prompt -- see app/models/db.py's Message.recalled_memories
         # docstring for why this outlives edits/deletes to the memory itself.
         recalled_memories=recalled_snapshot,
+        # Same reasoning: a citation has to keep saying what the answer was
+        # based on, even after the document is deleted or the page changes.
+        citations=citations,
     )
     session.add(assistant_message)
 
@@ -218,6 +272,8 @@ async def send_message(
         model_used=response.model,
         fell_back=fell_back,
         filtered=filtered,
+        tool_used=tool_used,
+        tool_summary=tool_summary,
     )
 
 

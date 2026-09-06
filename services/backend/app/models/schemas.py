@@ -27,6 +27,29 @@ class RecalledMemory(BaseModel):
     similarity: float
 
 
+class Citation(BaseModel):
+    """One source that grounded a reply (Phase 5).
+
+    A loose shape on purpose: `kind` is "document" or "web" and the other
+    fields differ between them. Modelling it as two strict variants would
+    mean a schema change every time a tool records one more field, and this
+    is a display record, not a contract another system depends on.
+    """
+
+    kind: str
+    # document
+    document_id: UUID | None = None
+    filename: str | None = None
+    page_number: int | None = None
+    content: str | None = None
+    similarity: float | None = None
+    # web
+    title: str | None = None
+    url: str | None = None
+    snippet: str | None = None
+    provider: str | None = None
+
+
 class MessageOut(BaseModel):
     id: UUID
     role: str
@@ -34,6 +57,7 @@ class MessageOut(BaseModel):
     persona: Persona | None
     created_at: datetime
     recalled_memories: list[RecalledMemory] = []
+    citations: list[Citation] = []
 
     model_config = {"from_attributes": True}
 
@@ -47,6 +71,13 @@ class ChatMessageResponse(BaseModel):
     # refusal (app/personas/safety.py). Lets the UI surface that a safety
     # layer actually did something, not just claim to have one.
     filtered: bool = False
+    # Phase 5. `tool_used` is None when no tool ran -- including when one was
+    # attempted and failed, in which case `tool_summary` says so. The UI must
+    # be able to tell "answered from the model's own knowledge" apart from
+    # "tried to look it up and could not", because those deserve different
+    # amounts of trust.
+    tool_used: str | None = None
+    tool_summary: str = ""
 
 
 class ConversationOut(BaseModel):
@@ -71,6 +102,52 @@ class PersonaInfo(BaseModel):
     id: Persona
     display_name: str
     tagline: str
+
+
+# --- Phase 5: documents and tools ----------------------------------------
+
+
+class DocumentStatus(StrEnum):
+    PENDING = "pending"
+    READY = "ready"
+    FAILED = "failed"
+
+
+class DocumentOut(BaseModel):
+    id: UUID
+    filename: str
+    content_type: str
+    size_bytes: int
+    status: DocumentStatus
+    #: Populated when status is "failed", and readable rather than a stack
+    #: trace -- a document that silently never becomes searchable is the
+    #: worst outcome, so the reason is always shown.
+    error: str | None
+    chunk_count: int
+    page_count: int | None
+    created_at: datetime
+    updated_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+class DocumentUploadResponse(BaseModel):
+    document: DocumentOut
+    #: True when this file was already uploaded (same extracted text) and no
+    #: second copy was made. Not an error: the endpoint returns 200, not 409.
+    deduplicated: bool = False
+
+
+class ToolInfo(BaseModel):
+    """One entry in GET /tools."""
+
+    name: str
+    description: str
+    requires_permission: bool
+    #: Whether it can actually run right now, and why not if it cannot. A
+    #: tool that is listed but always fails is worse than one that is absent.
+    available: bool
+    reason: str = ""
 
 
 # --- Phase 4: runtime model swap -----------------------------------------

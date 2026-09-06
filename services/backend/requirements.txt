@@ -16,6 +16,15 @@ alembic==1.19.1
 google-genai==2.21.0
 groq==1.7.0
 
+# ── RAG / documents (Phase 5) ─────────────────
+# Pure-Python, no system libraries, no service. pypdf also carries the page
+# numbers that make a citation actionable ("page 4") rather than vague.
+pypdf==6.1.1
+python-docx==1.2.0
+# Required by FastAPI to parse multipart uploads; without it POST /documents
+# raises at import time rather than at request time.
+python-multipart==0.0.20
+
 # ── Testing ───────────────────────────────────
 pytest==8.4.2
 pytest-asyncio==1.2.0
