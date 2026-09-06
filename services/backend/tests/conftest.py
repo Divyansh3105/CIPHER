@@ -31,7 +31,19 @@ from app.llm.router import LLMRouter, get_llm_router
 from app.main import app
 from app.memory.capture import get_memory_writer
 from app.memory.embedder import Embedder, EmbeddingError, get_embedder
-from app.memory.store import MEMORY_DEDUP_SIMILARITY, MemoryHit, MemoryStore, get_memory_store, hash_content
+from app.memory.store import (
+    MEMORY_DEDUP_SIMILARITY,
+    MEMORY_GRAPH_MAX_NODES,
+    MEMORY_GRAPH_MIN_SIMILARITY,
+    MEMORY_GRAPH_NEIGHBOURS,
+    MEMORY_GRAPH_SIGMA,
+    MemoryEdge,
+    MemoryGraph,
+    MemoryHit,
+    MemoryStore,
+    get_memory_store,
+    hash_content,
+)
 from app.models.db import Memory, User
 
 get_settings.cache_clear()
@@ -266,6 +278,98 @@ class InMemoryVectorStore(MemoryStore):
         memory = await session.get(Memory, memory_id)
         if memory is not None:
             memory.embedding = embedding
+
+    async def graph_for_user(
+        self,
+        session,
+        *,
+        user_id,
+        limit=MEMORY_GRAPH_MAX_NODES,
+        neighbours=MEMORY_GRAPH_NEIGHBOURS,
+        min_similarity=None,
+    ):
+        """Same KNN construction as PgVectorStore, in Python.
+
+        Reimplemented rather than stubbed because the parts worth testing are
+        not the SQL: that edges are deduplicated so a mutual pair appears
+        once, that every edge endpoint exists in the node list, and that an
+        unembedded memory comes back as an isolated node instead of being
+        dropped. All of that is expressible here.
+        """
+        result = await session.execute(
+            select(Memory)
+            .options(undefer(Memory.embedding))
+            .where(Memory.user_id == user_id)
+            .order_by(Memory.created_at.desc())
+            .limit(limit)
+        )
+        memories = list(result.scalars().all())
+        nodes = [(m, m.embedding is None) for m in memories]
+        if len(memories) < 2:
+            return MemoryGraph(nodes=nodes, edges=[], min_similarity=min_similarity or 0.0)
+
+        now = datetime.now(timezone.utc)
+
+        def _live(memory) -> bool:
+            if memory.embedding is None:
+                return False
+            if memory.expires_at is None:
+                return True
+            expires_at = memory.expires_at
+            if expires_at.tzinfo is None:
+                expires_at = expires_at.replace(tzinfo=timezone.utc)
+            return expires_at > now
+
+        def _cosine(a, b):
+            dot = sum(x * y for x, y in zip(a, b))
+            norm_a = math.sqrt(sum(x * x for x in a))
+            norm_b = math.sqrt(sum(x * x for x in b))
+            if norm_a == 0 or norm_b == 0:
+                return 0.0
+            return dot / (norm_a * norm_b)
+
+        linkable = [m for m in memories if _live(m)]
+
+        # Same adaptive floor as PgVectorStore: mean + sigma * stdev over
+        # every pair, not just the KNN survivors.
+        all_scores = [
+            _cosine(a.embedding, b.embedding)
+            for i, a in enumerate(linkable)
+            for j, b in enumerate(linkable)
+            if i != j
+        ]
+        if min_similarity is not None:
+            floor = min_similarity
+        elif all_scores:
+            mean = sum(all_scores) / len(all_scores)
+            variance = sum((x - mean) ** 2 for x in all_scores) / max(1, len(all_scores) - 1)
+            floor = max(MEMORY_GRAPH_MIN_SIMILARITY, mean + MEMORY_GRAPH_SIGMA * math.sqrt(variance))
+        else:
+            floor = MEMORY_GRAPH_MIN_SIMILARITY
+
+        edges: dict[tuple, MemoryEdge] = {}
+        for source in linkable:
+            scored = sorted(
+                ((_cosine(source.embedding, other.embedding), other) for other in linkable if other.id != source.id),
+                key=lambda pair: pair[0],
+                reverse=True,
+            )
+            for similarity, target in scored[:neighbours]:
+                if similarity < floor:
+                    continue
+                key = (
+                    (source.id, target.id)
+                    if str(source.id) < str(target.id)
+                    else (target.id, source.id)
+                )
+                if key not in edges:
+                    edges[key] = MemoryEdge(source_id=key[0], target_id=key[1], similarity=similarity)
+
+        return MemoryGraph(
+            nodes=nodes,
+            edges=sorted(edges.values(), key=lambda e: e.similarity, reverse=True),
+            min_similarity=floor,
+        )
 
 
 @pytest.fixture

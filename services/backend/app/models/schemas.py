@@ -147,6 +147,53 @@ class MemoryOut(BaseModel):
     model_config = {"from_attributes": True}
 
 
+class MemoryGraphNode(BaseModel):
+    """One memory as a graph node (GET /memory/graph).
+
+    Carries the full content rather than a truncated label: the frontend
+    shows the whole memory in an inspector panel when a node is selected, and
+    a second round trip per click to fetch text we already had in hand would
+    make the graph feel broken.
+    """
+
+    id: UUID
+    content: str
+    memory_type: MemoryType
+    source: str
+    persona: Persona | None
+    created_at: datetime
+    last_recalled_at: datetime | None
+    # True means stored but not yet searchable -- such a node is always
+    # isolated, and the UI says why rather than leaving it a mystery.
+    embedding_pending: bool = False
+
+
+class MemoryGraphLink(BaseModel):
+    # Named `source`/`target` rather than `source_id`/`target_id` because
+    # that is the shape force-directed graph libraries expect, and renaming
+    # in the client would be a pointless second vocabulary.
+    source: UUID
+    target: UUID
+    similarity: float
+
+
+class MemoryGraphResponse(BaseModel):
+    nodes: list[MemoryGraphNode]
+    links: list[MemoryGraphLink]
+    # Total memories this user has, before the node cap. Reported so the UI
+    # can say "showing 400 of 812" instead of quietly drawing a partial
+    # picture of what the assistant remembers.
+    total: int
+    truncated: bool
+    # The floor actually applied. When `adaptive` is true this was derived
+    # from this store's own similarity distribution rather than requested --
+    # a fixed constant does not survive contact with real embeddings, see
+    # MEMORY_GRAPH_SIGMA in app/memory/store.py.
+    min_similarity: float
+    adaptive: bool
+    neighbours: int
+
+
 class MemoryCreate(BaseModel):
     content: str = Field(min_length=1, max_length=2000)
     memory_type: MemoryType = MemoryType.LONG_TERM

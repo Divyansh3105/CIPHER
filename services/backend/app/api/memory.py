@@ -8,15 +8,29 @@ as an explicit user control, and the dashboard (Phase 3 plan) needs it.
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import delete
+from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_user_id
 from app.core.database import get_session
 from app.memory.embedder import Embedder, EmbeddingError, get_embedder
-from app.memory.store import MemoryStore, get_memory_store, hash_content
+from app.memory.store import (
+    MEMORY_GRAPH_MAX_NODES,
+    MEMORY_GRAPH_NEIGHBOURS,
+    MemoryStore,
+    get_memory_store,
+    hash_content,
+)
 from app.models.db import Memory
-from app.models.schemas import MemoryCreate, MemoryCreateResponse, MemoryOut, MemoryUpdate
+from app.models.schemas import (
+    MemoryCreate,
+    MemoryCreateResponse,
+    MemoryGraphLink,
+    MemoryGraphNode,
+    MemoryGraphResponse,
+    MemoryOut,
+    MemoryUpdate,
+)
 
 router = APIRouter(prefix="/memory", tags=["memory"])
 
@@ -102,6 +116,60 @@ async def create_memory(
 
     return MemoryCreateResponse(
         memory=_memory_out(memory, embedding_pending=embedding_pending), deduplicated=deduplicated
+    )
+
+
+@router.get("/graph", response_model=MemoryGraphResponse)
+async def memory_graph(
+    limit: int = Query(default=MEMORY_GRAPH_MAX_NODES, ge=1, le=MEMORY_GRAPH_MAX_NODES),
+    neighbours: int = Query(default=MEMORY_GRAPH_NEIGHBOURS, ge=1, le=10),
+    # Omitted means "derive it from this store" -- see MEMORY_GRAPH_SIGMA.
+    # The dashboard slider passes an explicit value to override that.
+    min_similarity: float | None = Query(default=None, ge=0.0, le=1.0),
+    session: AsyncSession = Depends(get_session),
+    user_id: UUID = Depends(get_current_user_id),
+    store: MemoryStore = Depends(get_memory_store),
+) -> MemoryGraphResponse:
+    """The memory store as a similarity graph.
+
+    Declared above the `/{memory_id}` routes on purpose: FastAPI matches in
+    declaration order, so a literal path registered after a parameterised one
+    on the same prefix never gets reached -- `/memory/all` already had to
+    learn this. A test in tests/test_memory_api.py pins the ordering.
+    """
+    graph = await store.graph_for_user(
+        session,
+        user_id=user_id,
+        limit=limit,
+        neighbours=neighbours,
+        min_similarity=min_similarity,
+    )
+    total = await session.scalar(select(func.count()).select_from(Memory).where(Memory.user_id == user_id))
+    total = int(total or 0)
+
+    return MemoryGraphResponse(
+        nodes=[
+            MemoryGraphNode(
+                id=memory.id,
+                content=memory.content,
+                memory_type=memory.memory_type,
+                source=memory.source,
+                persona=memory.persona,
+                created_at=memory.created_at,
+                last_recalled_at=memory.last_recalled_at,
+                embedding_pending=pending,
+            )
+            for memory, pending in graph.nodes
+        ],
+        links=[
+            MemoryGraphLink(source=e.source_id, target=e.target_id, similarity=e.similarity)
+            for e in graph.edges
+        ],
+        total=total,
+        truncated=total > len(graph.nodes),
+        min_similarity=graph.min_similarity,
+        adaptive=min_similarity is None,
+        neighbours=neighbours,
     )
 
 
