@@ -22,6 +22,14 @@ class GroqProvider(LLMProvider):
 
     async def agenerate(self, messages: list[LLMMessage], model: str | None = None) -> LLMResponse:
         model = model or self._model
+        if any(m.images for m in messages):
+            # Refused rather than dropped. Sending the text alone would
+            # produce a confident answer about an image this model never
+            # saw, which is the worst available outcome.
+            raise LLMProviderError(
+                f"{model} cannot accept images. Pin a vision-capable model, or leave the "
+                f"default routing to Gemini."
+            )
         try:
             response = await self._client.chat.completions.create(
                 model=model,

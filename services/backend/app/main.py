@@ -6,11 +6,13 @@ from fastapi.responses import JSONResponse
 from sqlalchemy.exc import SQLAlchemyError
 
 from app.api.agents import router as agents_router
+from app.api.automation import router as automation_router
 from app.api.chat import router as chat_router
 from app.api.documents import router as documents_router
 from app.api.memory import router as memory_router
 from app.api.models import router as models_router
 from app.api.tools import router as tools_router
+from app.api.vision import router as vision_router
 from app.api.personas import router as personas_router
 from app.core.config import get_settings
 
@@ -33,6 +35,8 @@ app.include_router(models_router)
 app.include_router(documents_router)
 app.include_router(tools_router)
 app.include_router(agents_router)
+app.include_router(automation_router)
+app.include_router(vision_router)
 app.include_router(personas_router)
 
 

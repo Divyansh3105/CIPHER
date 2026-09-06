@@ -109,6 +109,83 @@ class PersonaInfo(BaseModel):
     tagline: str
 
 
+# --- Phase 7: automation and vision --------------------------------------
+
+
+class PermissionLevel(StrEnum):
+    SESSION = "session"
+    TRUSTED = "trusted"
+
+
+class ActionInfo(BaseModel):
+    """One entry in GET /automation/actions."""
+
+    name: str
+    description: str
+    category: str
+    #: "read_only" | "session" | "sensitive"
+    risk: str
+    #: Whether it could run right now with no further approval.
+    allowed_now: bool
+    #: Empty when allowed_now. Says what is missing, so the UI can offer the
+    #: fix rather than only reporting a wall.
+    reason: str = ""
+    #: True for every sensitive action, always -- session approval never
+    #: silently covers those (docs/architecture.md Section 9).
+    needs_confirmation: bool = False
+
+
+class AutomationStatus(BaseModel):
+    #: False when AUTOMATION_ENABLED is unset. Nothing runs in that state.
+    enabled: bool
+    kill_switch_engaged: bool
+    actions: list[ActionInfo]
+    notice: str = ""
+
+
+class PermissionGrantRequest(BaseModel):
+    #: An action name or a category.
+    action_name: str = Field(min_length=1, max_length=60)
+    level: PermissionLevel = PermissionLevel.SESSION
+
+
+class AutomationExecuteRequest(BaseModel):
+    action_name: str = Field(min_length=1, max_length=60)
+    arguments: dict = Field(default_factory=dict)
+    persona: str | None = None
+    #: The per-action confirmation. Required for every sensitive action,
+    #: every time, regardless of any grant.
+    confirmed: bool = False
+
+
+class AutomationExecuteResponse(BaseModel):
+    action_name: str
+    outcome: str
+    summary: str
+    detail: str = ""
+
+
+class ActivityLogOut(BaseModel):
+    id: UUID
+    action_name: str
+    category: str
+    risk: str
+    persona: str | None
+    arguments: dict
+    #: "approved" | "denied" | "executed" | "failed" | "blocked"
+    outcome: str
+    reason: str | None
+    result: str | None
+    created_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+class VisionResponse(BaseModel):
+    answer: str
+    model_used: str
+
+
 # --- Phase 6: agents -----------------------------------------------------
 
 

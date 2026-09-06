@@ -16,6 +16,7 @@ DEFAULT_MODEL = "gemini-3.6-flash"
 
 class GeminiProvider(LLMProvider):
     name = "gemini"
+    supports_vision = True
 
     def __init__(self, api_key: str, model: str = DEFAULT_MODEL) -> None:
         self._client = genai.Client(api_key=api_key)
@@ -26,14 +27,20 @@ class GeminiProvider(LLMProvider):
         system_parts = [m.content for m in messages if m.role == "system"]
         system_instruction = "\n\n".join(system_parts) or None
 
-        contents = [
-            types.Content(
-                role="model" if m.role == "assistant" else "user",
-                parts=[types.Part.from_text(text=m.content)],
+        contents = []
+        for m in messages:
+            if m.role == "system":
+                continue
+            parts = [types.Part.from_text(text=m.content)]
+            # Images after the text: the question frames what to look for,
+            # and putting it first measurably improves grounding.
+            parts.extend(
+                types.Part.from_bytes(data=image.data, mime_type=image.media_type)
+                for image in m.images
             )
-            for m in messages
-            if m.role != "system"
-        ]
+            contents.append(
+                types.Content(role="model" if m.role == "assistant" else "user", parts=parts)
+            )
 
         try:
             response = await self._client.aio.models.generate_content(
