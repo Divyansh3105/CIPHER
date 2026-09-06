@@ -1,19 +1,45 @@
 "use client";
 
 import Link from "next/link";
-import { useEffect, useState } from "react";
+import { useSearchParams } from "next/navigation";
+import { Suspense, useCallback, useEffect, useState } from "react";
 import MemoryCard from "@/components/MemoryCard";
+import MemoryGalaxy from "@/components/MemoryGalaxy";
 import {
   ApiError,
   type Memory,
+  type MemoryGraph,
   createMemory,
   deleteAllMemories,
   deleteMemory,
+  getMemoryGraph,
   listMemories,
   updateMemory,
 } from "@/lib/api";
 
-export default function MemoryPage() {
+type View = "list" | "galaxy";
+
+/**
+ * `useSearchParams` bails out of prerendering up to the nearest Suspense
+ * boundary, and a production build of a static route fails outright without
+ * one (next/dist/docs, use-search-params). The boundary lives here rather
+ * than in a layout so the fallback can look like this page.
+ */
+export default function MemoryPageRoute() {
+  return (
+    <Suspense
+      fallback={
+        <div className="mx-auto w-full max-w-2xl flex-1 px-4 py-6 text-sm text-zinc-500 dark:text-zinc-400">
+          Loading memories…
+        </div>
+      }
+    >
+      <MemoryPage />
+    </Suspense>
+  );
+}
+
+function MemoryPage() {
   const [memories, setMemories] = useState<Memory[]>([]);
   const [loading, setLoading] = useState(true);
   const [draft, setDraft] = useState("");
@@ -21,6 +47,53 @@ export default function MemoryPage() {
   const [busyId, setBusyId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  // Arriving from a "Recalled" chip in chat deep-links straight to the node
+  // that answered: /memory?view=galaxy&focus=<memory id>.
+  const searchParams = useSearchParams();
+  const focusId = searchParams.get("focus");
+  const [view, setView] = useState<View>(
+    searchParams.get("view") === "galaxy" || focusId ? "galaxy" : "list"
+  );
+  const [graph, setGraph] = useState<MemoryGraph | null>(null);
+  const [graphLoading, setGraphLoading] = useState(false);
+
+  const loadGraph = useCallback(
+    async (options: { neighbours: number; minSimilarity: number | null }) => {
+      setGraphLoading(true);
+      try {
+        setGraph(await getMemoryGraph(options));
+      } catch (err) {
+        setError(err instanceof ApiError ? err.message : "Failed to load the memory graph.");
+      } finally {
+        setGraphLoading(false);
+      }
+    },
+    []
+  );
+
+  // Loaded from the tab click rather than an effect on `view`. It is an
+  // O(n^2) similarity query, so it should run when someone asks for it, not
+  // as a side effect of a state change -- and fetching here means switching
+  // back always reflects edits made in the list view instead of showing a
+  // stale picture.
+  function showGalaxy() {
+    setView("galaxy");
+    void loadGraph({ neighbours: 3, minSimilarity: null });
+  }
+
+  // Only for the deep-linked case, where the galaxy is the landing view and
+  // there was no click to hang the fetch off. Deliberately uses the promise
+  // callback rather than `loadGraph`: setting state synchronously inside an
+  // effect body triggers a cascading render (react-hooks/set-state-in-effect),
+  // and the component shows its own loading state meanwhile.
+  useEffect(() => {
+    if (view !== "galaxy") return;
+    getMemoryGraph({ neighbours: 3 })
+      .then(setGraph)
+      .catch((err) => setError(err instanceof ApiError ? err.message : "Failed to load the memory graph."));
+    // Mount only: every later switch into the galaxy goes through showGalaxy().
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -112,17 +185,45 @@ export default function MemoryPage() {
   }
 
   return (
-    <div className="mx-auto flex w-full max-w-2xl flex-1 flex-col bg-white px-4 py-6 dark:bg-black">
+    <div
+      className={`mx-auto flex w-full flex-1 flex-col bg-white px-4 py-6 dark:bg-black ${
+        view === "galaxy" ? "max-w-5xl" : "max-w-2xl"
+      }`}
+    >
       <header className="mb-6 flex items-center justify-between">
         <h1 className="text-sm font-semibold tracking-wide text-zinc-900 dark:text-zinc-100">
           What CIPHER remembers
         </h1>
-        <Link
-          href="/"
-          className="text-xs font-semibold uppercase tracking-wide text-zinc-500 hover:text-zinc-900 dark:text-zinc-400 dark:hover:text-zinc-100"
-        >
-          ← Chat
-        </Link>
+        <div className="flex items-center gap-3">
+          <div
+            className="flex overflow-hidden rounded-lg border border-zinc-300 text-xs dark:border-zinc-700"
+            role="tablist"
+            aria-label="Memory view"
+          >
+            {(["list", "galaxy"] as const).map((option) => (
+              <button
+                key={option}
+                type="button"
+                role="tab"
+                aria-selected={view === option}
+                onClick={() => (option === "galaxy" ? showGalaxy() : setView("list"))}
+                className={
+                  view === option
+                    ? "bg-zinc-900 px-3 py-1 font-semibold text-zinc-50 dark:bg-zinc-100 dark:text-zinc-900"
+                    : "px-3 py-1 text-zinc-500 hover:text-zinc-900 dark:text-zinc-400 dark:hover:text-zinc-100"
+                }
+              >
+                {option === "list" ? "List" : "Galaxy"}
+              </button>
+            ))}
+          </div>
+          <Link
+            href="/"
+            className="text-xs font-semibold uppercase tracking-wide text-zinc-500 hover:text-zinc-900 dark:text-zinc-400 dark:hover:text-zinc-100"
+          >
+            ← Chat
+          </Link>
+        </div>
       </header>
 
       {notice && (
@@ -161,9 +262,16 @@ export default function MemoryPage() {
       <section className="flex-1">
         <div className="mb-3 flex items-center justify-between">
           <span className="text-xs font-semibold uppercase tracking-wide text-zinc-500 dark:text-zinc-400">
-            {memories.length} {memories.length === 1 ? "memory" : "memories"}
+            {/* In the galaxy the list may not have loaded at all (deep links
+                land straight here), and showing "0 memories" above a full
+                graph is worse than showing nothing. Count what is on screen. */}
+            {view === "galaxy"
+              ? graph
+                ? `${graph.total} ${graph.total === 1 ? "memory" : "memories"}`
+                : ""
+              : `${memories.length} ${memories.length === 1 ? "memory" : "memories"}`}
           </span>
-          {memories.length > 0 && (
+          {view === "list" && memories.length > 0 && (
             <button
               type="button"
               disabled={pending}
@@ -175,7 +283,9 @@ export default function MemoryPage() {
           )}
         </div>
 
-        {loading ? (
+        {view === "galaxy" ? (
+          <MemoryGalaxy graph={graph} loading={graphLoading} onReload={loadGraph} focusId={focusId} />
+        ) : loading ? (
           <p className="text-sm text-zinc-500 dark:text-zinc-400">Loading…</p>
         ) : memories.length === 0 ? (
           <p className="text-sm text-zinc-500 dark:text-zinc-400">Nothing stored yet.</p>

@@ -194,6 +194,73 @@ export function createTranscriptBuffer({
   };
 }
 
+// --- Wake word ---------------------------------------------------------
+
+/**
+ * The phrase that starts a hands-free turn.
+ *
+ * Deliberately not Picovoice Porcupine, which the architecture doc named.
+ * Porcupine needs an account whose signup asks for a work email, and it buys
+ * nothing here: recognition is already streaming a live transcript, so the
+ * wake phrase can be matched in text with no new dependency, no key, and no
+ * second audio pipeline running alongside the first.
+ *
+ * What that trade-off costs, stated plainly: a real wake-word engine runs a
+ * tiny local model and keeps the audio on the device until it fires. This
+ * approach has the recogniser -- and therefore the browser's speech service
+ * -- listening the whole time. That is the right default for a local dev
+ * assistant and the wrong one for an always-on device in a shared room,
+ * which is why hands-free is opt-in per session and never remembered.
+ *
+ * Letters and spaces only: it is interpolated into a RegExp, and keeping it
+ * to plain words means there is nothing to escape and no way to turn a
+ * config value into a pattern by accident.
+ */
+export const WAKE_WORD = "cipher";
+
+/**
+ * How long after a reply you may speak again without repeating the wake word.
+ *
+ * Without a follow-up window every turn has to start with "hey cipher",
+ * which stops feeling like conversation almost immediately. With one, the
+ * wake word opens a conversation instead of gating each sentence.
+ */
+export const WAKE_FOLLOW_UP_MS = 20000;
+
+const WAKE_LEAD_INS = ["hey", "ok", "okay", "hi", "yo", "hello"];
+
+export interface WakeMatch {
+  matched: boolean;
+  /** What was said after the wake phrase; empty when it was said alone. */
+  remainder: string;
+}
+
+/**
+ * Match "hey cipher, what time is it" and return "what time is it".
+ *
+ * Anchored to the start of the utterance on purpose. A wake word that fires
+ * from anywhere in a sentence turns every mention of the assistant's own
+ * name into a command -- and this assistant is called CIPHER, so its name
+ * comes up often. "I renamed the cipher module" must stay a sentence.
+ */
+export function matchWakePhrase(text: string, wakeWord: string = WAKE_WORD): WakeMatch {
+  const trimmed = text.trim();
+  const leadIn = WAKE_LEAD_INS.join("|");
+  // Tolerates the punctuation recognition sprinkles around a name, and the
+  // optional greeting in front of it.
+  const pattern = new RegExp(
+    `^(?:(?:${leadIn}),?\\s+)?${wakeWord}\\b[,.!?]*\\s*(.*)$`,
+    "is"
+  );
+  const match = trimmed.match(pattern);
+  if (!match) return { matched: false, remainder: "" };
+
+  // Slice the ORIGINAL string rather than returning the matched group, so
+  // capitalisation and punctuation survive: the remainder becomes the user's
+  // stored message, not just a lookup key.
+  return { matched: true, remainder: trimmed.slice(trimmed.length - match[1].length).trim() };
+}
+
 // --- Reading model output aloud ----------------------------------------
 
 /** Longest utterance we will hand to speechSynthesis in one go. */

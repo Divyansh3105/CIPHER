@@ -9,6 +9,7 @@ import PersonaSwitcher from "@/components/PersonaSwitcher";
 import VoiceControls, { type VoiceState } from "@/components/VoiceControls";
 import ModelChip from "@/components/ModelChip";
 import { useSpeechInput, useSpeechOutput } from "@/hooks/useVoice";
+import { matchWakePhrase, WAKE_FOLLOW_UP_MS } from "@/lib/speech";
 import {
   type ActiveModel,
   ApiError,
@@ -70,6 +71,53 @@ export default function Home() {
   // reputation for not listening, so the status line says so.
   const [droppedUtterance, setDroppedUtterance] = useState(false);
 
+  // Hands-free: ignore everything until addressed by name. Opt-in per
+  // session and never persisted -- see WAKE_WORD in @/lib/speech for why
+  // an always-listening default is the wrong one.
+  const [handsFree, setHandsFree] = useState(false);
+  // Whether the follow-up window is currently open, so a conversation
+  // does not require saying the name every single turn.
+  //
+  // Modelled as a flag plus a restart counter rather than an expiry
+  // timestamp. A timestamp would mean comparing it against `Date.now()`
+  // while deciding what to render, and a component that reads the clock
+  // during render is not idempotent -- it can show a different thing on a
+  // re-render nothing asked for. The counter drives an effect that owns
+  // the timer, so re-arming restarts it and no render ever reads a clock.
+  const [wakeArmed, setWakeArmed] = useState(false);
+  const [wakeArmCount, setWakeArmCount] = useState(0);
+  // The mic callback fires outside React's cycle and needs the current
+  // values synchronously.
+  const wakeArmedRef = useRef(false);
+  const handsFreeRef = useRef(false);
+
+  const armWakeWindow = useCallback(() => {
+    wakeArmedRef.current = true;
+    setWakeArmed(true);
+    setWakeArmCount((n) => n + 1);
+  }, []);
+
+  const disarmWakeWindow = useCallback(() => {
+    wakeArmedRef.current = false;
+    setWakeArmed(false);
+  }, []);
+
+  useEffect(() => {
+    handsFreeRef.current = handsFree;
+  }, [handsFree]);
+
+  useEffect(() => {
+    if (!wakeArmed) return;
+    const timer = setTimeout(() => {
+      wakeArmedRef.current = false;
+      setWakeArmed(false);
+    }, WAKE_FOLLOW_UP_MS);
+    // Re-arming bumps wakeArmCount, which re-runs this effect and clears
+    // the previous timer -- the window restarts rather than expiring on
+    // the first arm's schedule.
+    return () => clearTimeout(timer);
+  }, [wakeArmed, wakeArmCount]);
+
   // Only these lead-ins are treated as a spoken command rather than a
   // message. Deliberately narrow: "use" and "try" are excluded because
   // "use simpler words" is a perfectly ordinary thing to say to a chatbot,
@@ -123,9 +171,28 @@ export default function Home() {
         return;
       }
       setDroppedUtterance(false);
+
+      let spoken = text;
+      if (handsFreeRef.current) {
+        const { matched, remainder } = matchWakePhrase(text);
+        const withinFollowUp = wakeArmedRef.current;
+        if (matched) {
+          armWakeWindow();
+          // The name on its own opens the floor rather than being sent
+          // as a message -- "hey cipher" is not a question.
+          if (!remainder) return;
+          spoken = remainder;
+        } else if (!withinFollowUp) {
+          // Not addressed to us. Dropped silently and on purpose: the
+          // entire point of hands-free is that ambient conversation in
+          // the room is not a prompt.
+          return;
+        }
+      }
+
       void (async () => {
-        if (await handleSpokenCommand(text)) return;
-        await handleSend(text);
+        if (await handleSpokenCommand(spoken)) return;
+        await handleSend(spoken);
       })();
     },
     onInterrupt: () => speech.cancel(),
@@ -216,6 +283,8 @@ export default function Home() {
       const result = await sendMessage(content, activeId ?? undefined, persona);
       setActiveId(result.conversation_id);
       setMessages((prev) => [...prev, result.message]);
+      // Keep the floor open for a follow-up without the wake word.
+      if (handsFree) armWakeWindow();
       if (voiceReplies) {
         // Spoken in the voice of the persona that actually answered, which
         // after a mid-conversation switch is not necessarily the one now
@@ -238,11 +307,20 @@ export default function Home() {
     }
   }
 
+  function handleToggleHandsFree() {
+    disarmWakeWindow();
+    setHandsFree((on) => !on);
+  }
+
   function handleToggleMic() {
     setDroppedUtterance(false);
     if (mic.enabled) {
       mic.stop();
       speech.cancel();
+      // Hands-free without a mic is a contradiction, and leaving it on
+      // would silently swallow the next session's first utterance.
+      setHandsFree(false);
+      disarmWakeWindow();
       return;
     }
     mic.start();
@@ -299,9 +377,11 @@ export default function Home() {
         ? "speaking"
         : pending
           ? "thinking"
-          : mic.enabled
-            ? "listening"
-            : "off";
+          : !mic.enabled
+            ? "off"
+            : handsFree && !wakeArmed
+              ? "waiting"
+              : "listening";
 
   return (
     <div className="flex flex-1 bg-white dark:bg-black">
@@ -355,6 +435,8 @@ export default function Home() {
         <VoiceControls
           state={voiceState}
           micOn={mic.enabled}
+          handsFree={handsFree}
+          onToggleHandsFree={handleToggleHandsFree}
           interim={mic.interim}
           error={mic.error}
           persona={persona}

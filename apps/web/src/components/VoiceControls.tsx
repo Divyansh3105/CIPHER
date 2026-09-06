@@ -9,13 +9,25 @@
 // on screen, in words.
 
 import type { Persona } from "@/lib/personas";
+import { WAKE_WORD } from "@/lib/speech";
 
-export type VoiceState = "unsupported" | "off" | "listening" | "thinking" | "speaking" | "dropped";
+export type VoiceState =
+  | "unsupported"
+  | "off"
+  | "listening"
+  | "thinking"
+  | "speaking"
+  | "dropped"
+  // Hands-free is on but nothing has been addressed to us yet: heard,
+  // not listened to. Distinct from "listening" because that difference
+  // is exactly what the user needs to know before they start talking.
+  | "waiting";
 
 const DOT_CLASSES: Record<VoiceState, string> = {
   unsupported: "bg-zinc-400",
   off: "bg-zinc-400",
   dropped: "bg-red-500",
+  waiting: "bg-zinc-400",
   listening: "bg-emerald-500 animate-pulse",
   thinking: "bg-amber-500 animate-pulse",
   speaking: "bg-sky-500 animate-pulse",
@@ -24,6 +36,8 @@ const DOT_CLASSES: Record<VoiceState, string> = {
 export default function VoiceControls({
   state,
   micOn,
+  handsFree,
+  onToggleHandsFree,
   interim,
   error,
   persona,
@@ -43,6 +57,9 @@ export default function VoiceControls({
    * the mic button up during an ordinary typed conversation.
    */
   micOn: boolean;
+  /** Ignore speech until addressed by name. */
+  handsFree: boolean;
+  onToggleHandsFree: () => void;
   interim: string;
   error: string | null;
   persona: Persona;
@@ -61,11 +78,14 @@ export default function VoiceControls({
     switch (state) {
       case "off":
         return `Click the mic and talk to ${personaLabel}.`;
+      case "waiting":
+        return `Hands-free — say “Hey ${WAKE_WORD}” to get ${personaLabel}’s attention.`;
       case "dropped":
         return `Didn't catch that — ${personaLabel} was still answering. Say it again.`;
       case "listening":
-        return interim
-          ? `Listening — “${interim}”`
+        if (interim) return `Listening — “${interim}”`;
+        return handsFree
+          ? `Go ahead — no need to say “${WAKE_WORD}” again for a moment.`
           : "Listening… keep going, a short pause won’t cut you off.";
       case "thinking":
         return `${personaLabel} is thinking…`;
@@ -118,6 +138,23 @@ export default function VoiceControls({
           Stop
         </button>
       )}
+
+      <label
+        className={[
+          "flex shrink-0 items-center gap-1.5 text-xs",
+          micOn ? "text-zinc-500 dark:text-zinc-400" : "text-zinc-400 opacity-50",
+        ].join(" ")}
+        title={`Ignore speech until you say “Hey ${WAKE_WORD}”`}
+      >
+        <input
+          type="checkbox"
+          className="accent-zinc-900 dark:accent-zinc-100"
+          checked={handsFree && micOn}
+          disabled={!micOn}
+          onChange={onToggleHandsFree}
+        />
+        Hands-free
+      </label>
 
       <label
         className={[

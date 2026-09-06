@@ -204,3 +204,52 @@ export function setActiveModel(spoken: string): Promise<ActiveModel> {
 export function clearActiveModel(): Promise<ActiveModel> {
   return request<ActiveModel>("/models/active", { method: "DELETE" });
 }
+
+// --- Phase 4: memory graph -------------------------------------------
+
+export interface MemoryGraphNode {
+  id: string;
+  content: string;
+  memory_type: MemoryType;
+  source: string;
+  persona: Persona | null;
+  created_at: string;
+  last_recalled_at: string | null;
+  // Stored but not yet searchable. Such a node is always isolated, and the
+  // galaxy says why rather than leaving it an unexplained loner.
+  embedding_pending: boolean;
+}
+
+export interface MemoryGraphLink {
+  source: string;
+  target: string;
+  similarity: number;
+}
+
+export interface MemoryGraph {
+  nodes: MemoryGraphNode[];
+  links: MemoryGraphLink[];
+  // Total memories before the node cap, so the view can admit to showing a
+  // subset instead of quietly drawing a partial picture.
+  total: number;
+  truncated: boolean;
+  // The floor actually applied. `adaptive` means it was derived from this
+  // store's own distribution rather than requested -- a fixed constant does
+  // not survive real embeddings, see MEMORY_GRAPH_SIGMA in the backend.
+  min_similarity: number;
+  adaptive: boolean;
+  neighbours: number;
+}
+
+export function getMemoryGraph(options?: {
+  neighbours?: number;
+  minSimilarity?: number | null;
+}): Promise<MemoryGraph> {
+  const params = new URLSearchParams();
+  if (options?.neighbours != null) params.set("neighbours", String(options.neighbours));
+  // null/undefined deliberately omits the parameter, which is what asks the
+  // backend to derive the floor instead of imposing one.
+  if (options?.minSimilarity != null) params.set("min_similarity", String(options.minSimilarity));
+  const query = params.toString();
+  return request<MemoryGraph>(`/memory/graph${query ? `?${query}` : ""}`);
+}
