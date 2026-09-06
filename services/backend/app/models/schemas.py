@@ -71,13 +71,18 @@ class ChatMessageResponse(BaseModel):
     # refusal (app/personas/safety.py). Lets the UI surface that a safety
     # layer actually did something, not just claim to have one.
     filtered: bool = False
-    # Phase 5. `tool_used` is None when no tool ran -- including when one was
-    # attempted and failed, in which case `tool_summary` says so. The UI must
-    # be able to tell "answered from the model's own knowledge" apart from
-    # "tried to look it up and could not", because those deserve different
+    # Phase 6 (was tool_used/tool_summary in Phase 5, renamed when the
+    # orchestrator took over routing -- the field now names an *agent*, and
+    # a field called tool_used holding "research" would be a small lie the
+    # next reader has to untangle).
+    #
+    # `agent_used` is None when nothing contributed -- INCLUDING when a
+    # specialist was chosen and failed, in which case `activity` says so.
+    # The UI must be able to tell "answered directly" apart from "tried a
+    # specialist and it did not work", because those deserve different
     # amounts of trust.
-    tool_used: str | None = None
-    tool_summary: str = ""
+    agent_used: str | None = None
+    activity: str = ""
 
 
 class ConversationOut(BaseModel):
@@ -102,6 +107,54 @@ class PersonaInfo(BaseModel):
     id: Persona
     display_name: str
     tagline: str
+
+
+# --- Phase 6: agents -----------------------------------------------------
+
+
+class AgentInfo(BaseModel):
+    """One entry in GET /agents."""
+
+    name: str
+    description: str
+    timeout_seconds: float
+    #: False means the user switched it off; it is not offered to the router
+    #: at all. Absence from the settings table means enabled, so a newly
+    #: added agent works without anyone creating a row for it.
+    enabled: bool = True
+
+
+class AgentToggle(BaseModel):
+    enabled: bool
+
+
+class AgentRunStatus(StrEnum):
+    OK = "ok"
+    FAILED = "failed"
+    TIMEOUT = "timeout"
+    SKIPPED = "skipped"
+
+
+class AgentRunOut(BaseModel):
+    """One recorded agent invocation.
+
+    Failed, timed-out and did-nothing runs are returned alongside successful
+    ones on purpose: an activity view that only lists what worked lies by
+    omission, and "why was that answer ungrounded" is precisely the question
+    this table exists to answer.
+    """
+
+    id: UUID
+    agent_name: str
+    conversation_id: UUID | None
+    input: str
+    output: str | None
+    status: AgentRunStatus
+    error: str | None
+    duration_ms: int
+    created_at: datetime
+
+    model_config = {"from_attributes": True}
 
 
 # --- Phase 5: documents and tools ----------------------------------------

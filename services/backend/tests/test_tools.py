@@ -1,17 +1,19 @@
-"""Tool planning, tool failure, and document grounding in chat.
+"""Tool planning: choosing a tool, and refusing to.
 
-The tests that matter here are the ones about *not* using a tool and about
-tools failing. A planner that over-triggers makes every message slow and
-occasionally wrong; a tool failure that is swallowed makes the assistant
-answer as though it had looked something up when it had not.
+The tests that matter here are the ones about *not* using a tool. A planner
+that over-triggers makes every message slow and occasionally wrong, while a
+planner that under-triggers just answers from the model's own knowledge --
+which is what the assistant did for four phases.
+
+Chat-level integration (a tool result reaching the prompt, a tool failure
+being reported rather than swallowed) moved to tests/test_agents.py in
+Phase 6, when the orchestrator took over routing.
 """
 import pytest
 
 from app.llm.base import LLMMessage, LLMProviderError, LLMProvider, LLMResponse
-from app.main import app
-from app.tools.base import Tool, ToolError, ToolResult
+from app.tools.base import ToolResult
 from app.tools.planner import ToolPlanner
-from app.tools.registry import ToolRegistry, get_tool_registry
 from app.llm.router import LLMRouter
 from tests.conftest import RecordingTool
 
@@ -145,112 +147,3 @@ async def test_no_tools_available_means_no_planner_call():
 
     assert plan.tool_name is None
     assert provider.calls == []
-
-
-# --- chat integration ---------------------------------------------------
-
-
-async def test_a_tool_result_is_injected_and_reported(client, provider):
-    tool = RecordingTool("web_search", ToolResult(context="RESULT CONTEXT", citations=[{"kind": "web", "title": "T", "url": "u"}], summary="searched"))
-    app.dependency_overrides[get_tool_registry] = lambda: _RoutingRegistry([tool], "web_search", "delhi")
-    try:
-        response = await client.post("/chat/message", json={"content": "look up the weather in Delhi"})
-    finally:
-        app.dependency_overrides.pop(get_tool_registry, None)
-
-    body = response.json()
-    assert body["tool_used"] == "web_search"
-    assert body["tool_summary"] == "searched"
-    assert body["message"]["citations"][0]["title"] == "T"
-    # And the tool's output actually reached the prompt.
-    assert "RESULT CONTEXT" in provider.last_messages[0].content
-
-
-async def test_a_failing_tool_still_answers_and_says_it_failed(client):
-    """The one thing that must not happen is answering as if a tool had run."""
-
-    class Broken(Tool):
-        name = "web_search"
-        description = "broken"
-
-        async def run(self, query: str, **context) -> ToolResult:
-            raise ToolError("the search provider is down")
-
-    app.dependency_overrides[get_tool_registry] = lambda: _RoutingRegistry([Broken()], "web_search", "x")
-    try:
-        response = await client.post("/chat/message", json={"content": "look up the weather in Delhi"})
-    finally:
-        app.dependency_overrides.pop(get_tool_registry, None)
-
-    assert response.status_code == 200
-    body = response.json()
-    assert body["tool_used"] is None
-    assert "failed" in body["tool_summary"]
-    assert body["message"]["citations"] == []
-
-
-async def test_a_tool_raising_an_unexpected_error_does_not_take_the_reply_down(client):
-    """A tool talks to the network and to third-party JSON -- it is the least
-    trustworthy code in the request path.
-    """
-
-    class Exploding(Tool):
-        name = "web_search"
-        description = "explodes"
-
-        async def run(self, query: str, **context) -> ToolResult:
-            raise ValueError("unexpected")
-
-    app.dependency_overrides[get_tool_registry] = lambda: _RoutingRegistry([Exploding()], "web_search", "x")
-    try:
-        response = await client.post("/chat/message", json={"content": "look up the weather in Delhi"})
-    finally:
-        app.dependency_overrides.pop(get_tool_registry, None)
-
-    assert response.status_code == 200
-    assert response.json()["tool_used"] is None
-    assert "ValueError" in response.json()["tool_summary"]
-
-
-async def test_no_tools_registered_means_chat_is_unchanged(client, provider):
-    """The default path for four phases must keep working."""
-    response = await client.post("/chat/message", json={"content": "what is the capital of France"})
-
-    assert response.status_code == 200
-    assert response.json()["tool_used"] is None
-    # The block header, not just "What you looked up" -- that phrase also
-    # appears in the shared capability note, which is always present.
-    assert "This is retrieved data" not in provider.last_messages[0].content
-
-
-class _RoutingRegistry(ToolRegistry):
-    """A registry whose planner decision is fixed, so chat tests do not
-    depend on what a fake LLM happens to reply to the planner prompt.
-    """
-
-    def __init__(self, tools: list[Tool], forced_tool: str, forced_query: str) -> None:
-        super().__init__(tools)
-        self._forced = (forced_tool, forced_query)
-
-    async def available_for(self, session=None, *, user_id=None):
-        return self.all()
-
-
-@pytest.fixture(autouse=True)
-def _force_plan(monkeypatch, request):
-    """Pin the planner's answer for the chat integration tests above.
-
-    Without this they would be testing the fake LLM provider's reply to a
-    planner prompt, which is not the behaviour under test.
-    """
-    if "client" not in request.fixturenames:
-        return
-
-    async def fake_plan(self, message, tools):
-        from app.tools.planner import ToolPlan
-
-        if not tools:
-            return ToolPlan(None, reason="no tools available")
-        return ToolPlan(tools[0].name, "delhi weather")
-
-    monkeypatch.setattr(ToolPlanner, "plan", fake_plan)

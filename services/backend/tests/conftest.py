@@ -44,6 +44,9 @@ from app.memory.store import (
     get_memory_store,
     hash_content,
 )
+from app.agents.base import Agent, AgentContext, AgentResult
+from app.agents.orchestrator import Orchestrator
+from app.agents.registry import get_orchestrator
 from app.models.db import Memory, User
 from app.rag.ingest import get_document_ingestor
 from app.rag.store import ChunkHit, DocumentStore, get_document_store
@@ -432,6 +435,37 @@ class RecordingTool(Tool):
         return self._result
 
 
+class RecordingAgent(Agent):
+    """An agent that returns a canned result and remembers being called."""
+
+    def __init__(self, name: str = "fake_agent", result: AgentResult | None = None) -> None:
+        self.name = name
+        self.description = f"Fake agent {name} for tests."
+        self.calls: list[str] = []
+        self._result = result or AgentResult(
+            context="FAKE AGENT CONTEXT", summary="ran the fake agent", output="out"
+        )
+
+    async def run(self, context: AgentContext) -> AgentResult:
+        self.calls.append(context.message)
+        return self._result
+
+
+@pytest.fixture
+def orchestrator():
+    """Default override: NO agents at all.
+
+    Same rationale as the empty tool registry it sits above. With real agents
+    registered, every chat and persona test would make a routing LLM call --
+    landing in `provider.calls`, corrupting their message assertions, and
+    reaching the network if the fake ever fell through. Tests that are about
+    orchestration build their own.
+    """
+    from app.llm.router import LLMRouter
+
+    return Orchestrator(agents=[], llm_router=LLMRouter(primary=RecordingProvider(), fallback=RecordingProvider()))
+
+
 @pytest.fixture
 def tool_registry():
     """Default override: NO tools at all.
@@ -580,7 +614,16 @@ async def db_session():
 
 
 @pytest.fixture
-async def client(provider, embedder, memory_store, memory_writer, tool_registry, document_store, document_ingestor):
+async def client(
+    provider,
+    embedder,
+    memory_store,
+    memory_writer,
+    tool_registry,
+    orchestrator,
+    document_store,
+    document_ingestor,
+):
     engine = create_async_engine(
         "sqlite+aiosqlite:///:memory:",
         poolclass=StaticPool,
@@ -608,6 +651,7 @@ async def client(provider, embedder, memory_store, memory_writer, tool_registry,
     app.dependency_overrides[get_memory_store] = lambda: memory_store
     app.dependency_overrides[get_memory_writer] = lambda: memory_writer
     app.dependency_overrides[get_tool_registry] = lambda: tool_registry
+    app.dependency_overrides[get_orchestrator] = lambda: orchestrator
     app.dependency_overrides[get_document_store] = lambda: document_store
     app.dependency_overrides[get_document_ingestor] = lambda: document_ingestor
 

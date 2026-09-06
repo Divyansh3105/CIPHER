@@ -5,6 +5,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from sqlalchemy.exc import SQLAlchemyError
 
+from app.api.agents import router as agents_router
 from app.api.chat import router as chat_router
 from app.api.documents import router as documents_router
 from app.api.memory import router as memory_router
@@ -31,6 +32,7 @@ app.include_router(memory_router)
 app.include_router(models_router)
 app.include_router(documents_router)
 app.include_router(tools_router)
+app.include_router(agents_router)
 app.include_router(personas_router)
 
 

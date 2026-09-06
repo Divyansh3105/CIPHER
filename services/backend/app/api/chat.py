@@ -23,10 +23,10 @@ from app.models.schemas import (
     ConversationOut,
     MessageOut,
 )
+from app.agents.base import AgentContext
+from app.agents.orchestrator import Orchestrator
+from app.agents.registry import get_orchestrator
 from app.personas import PERSONAS, build_system_prompt, get_persona
-from app.tools.base import ToolError
-from app.tools.planner import ToolPlan, ToolPlanner
-from app.tools.registry import ToolRegistry, get_tool_registry
 
 logger = logging.getLogger(__name__)
 
@@ -47,11 +47,11 @@ MEMORY_TOP_K = 5
 MEMORY_MIN_SIMILARITY = 0.65
 MEMORY_MAX_CHARS = 1200
 
-# Phase 5: tool use. The planner runs before the reply, so a message that
-# needs a tool costs two LLM round trips plus the tool call. That is the
-# price of provider-agnostic tool use (app/tools/planner.py explains why
-# function-calling was not used), and it is why the planner short-circuits
-# small talk before spending anything.
+# Phase 6: the orchestrator replaced the Phase 5 tool planner in this
+# position. It is not an extra layer -- the routing call that used to choose
+# a *tool* now chooses an *agent*, and the research agent chooses the tool.
+# Two decisions, two levels, one owner each, and still one routing round trip
+# per non-trivial message rather than two.
 
 
 async def _get_owned_conversation(session: AsyncSession, conversation_id: UUID, user_id: UUID) -> Conversation:
@@ -89,7 +89,7 @@ async def send_message(
     embedder: Embedder = Depends(get_embedder),
     memory_store: MemoryStore = Depends(get_memory_store),
     memory_writer: MemoryWriter = Depends(get_memory_writer),
-    tool_registry: ToolRegistry = Depends(get_tool_registry),
+    orchestrator: Orchestrator = Depends(get_orchestrator),
     session_factory: async_sessionmaker = Depends(get_session_factory),
 ) -> ChatMessageResponse:
     if payload.conversation_id is not None:
@@ -151,47 +151,44 @@ async def send_message(
         recalled_snapshot.append({"id": str(hit.id), "content": content, "similarity": hit.similarity})
         budget -= len(content)
 
-    # --- Tool use (Phase 5) -------------------------------------------
+    # --- Agent orchestration (Phase 6) --------------------------------
     #
-    # Failures here are deliberately non-fatal. A search provider being down
-    # is a worse answer, not no answer, so the reply proceeds ungrounded and
-    # the UI reports what was attempted. The one thing that must not happen
-    # is answering *as if* a tool had run -- hence tool_summary carrying the
-    # failure into the response rather than being swallowed.
-    tool_context = ""
-    tool_summary = ""
-    tool_used: str | None = None
-    citations: list[dict] = []
+    # Orchestrator.run never raises: every failure path degrades to answering
+    # directly, because a broken specialist should cost grounding, not the
+    # reply. What must not happen is answering *as if* a specialist had
+    # contributed -- so `agent_used` is None when one failed, while `notice`
+    # says what was attempted.
+    orchestration = await orchestrator.run(
+        AgentContext(
+            message=payload.content,
+            user_id=user_id,
+            persona_id=persona.id,
+            session=session,
+            conversation_id=conversation.id,
+            history=[(m.role, m.content) for m in history],
+            recalled_memories=recalled_contents,
+        )
+    )
+    tool_context = orchestration.context
+    activity = orchestration.notice
+    agent_used = orchestration.agent_used
+    citations = orchestration.citations
 
-    offered = await tool_registry.available_for(session, user_id=user_id)
-    plan: ToolPlan = await ToolPlanner(llm_router).plan(payload.content, offered)
-
-    if plan.tool_name:
-        tool = tool_registry.get(plan.tool_name)
-        if tool is not None:
-            try:
-                result = await tool.run(plan.query, session=session, user_id=user_id)
-            except ToolError as exc:
-                logger.warning("Tool %s failed: %s", plan.tool_name, exc)
-                tool_summary = f"{plan.tool_name} failed: {exc}"
-            except Exception as exc:  # noqa: BLE001
-                # A tool is the least trustworthy code in the request path --
-                # it talks to the network and to third-party JSON. It must
-                # not be able to take the whole reply down with it.
-                logger.exception("Tool %s raised unexpectedly", plan.tool_name)
-                tool_summary = f"{plan.tool_name} failed unexpectedly ({type(exc).__name__})"
-            else:
-                tool_used = plan.tool_name
-                tool_context = result.context
-                tool_summary = result.summary
-                citations = result.citations
+    # Recorded in this request's transaction so a run row and the message it
+    # produced commit together -- an audit trail that can disagree with the
+    # conversation is worse than none.
+    for run in orchestration.runs:
+        session.add(run)
 
     system_prompt = build_system_prompt(
         persona,
         mixed_history=mixed_history,
         recalled_memories=recalled_contents,
         tool_context=tool_context,
-        tool_summary=tool_summary,
+        # The persona parameter is still called tool_summary: it labels the
+        # retrieved *material*, which is what a tool produced, regardless of
+        # which agent asked for it.
+        tool_summary=activity,
     )
     llm_messages = [LLMMessage(role="system", content=system_prompt)]
     llm_messages += [
@@ -272,8 +269,8 @@ async def send_message(
         model_used=response.model,
         fell_back=fell_back,
         filtered=filtered,
-        tool_used=tool_used,
-        tool_summary=tool_summary,
+        agent_used=agent_used,
+        activity=activity,
     )
 
 
