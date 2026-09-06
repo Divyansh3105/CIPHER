@@ -1,16 +1,15 @@
 """SQLAlchemy ORM models.
 
 users, conversations, messages (Phase 1); memories (Phase 3); documents and
-document_chunks (Phase 5).
+document_chunks (Phase 5); agents and agent_runs (Phase 6).
 
-Later phases add `tasks`, `agents`/`agent_runs`, `tools`, `permissions`, and
-`activity_logs` (see docs/architecture.md, Section 12) -- deliberately not
-created yet.
+Later phases add `tasks`, `tools`, `permissions`, and `activity_logs` (see
+docs/architecture.md, Section 12) -- deliberately not created yet.
 """
 import uuid
 from datetime import datetime
 
-from sqlalchemy import DateTime, ForeignKey, Index, Integer, JSON, String, Text, Uuid, func, text
+from sqlalchemy import Boolean, DateTime, ForeignKey, Index, Integer, JSON, String, Text, Uuid, func, text
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -94,6 +93,62 @@ class Message(Base):
 
     __table_args__ = (
         Index("ix_messages_conversation_id", "conversation_id"),
+    )
+
+
+class Agent(Base):
+    """Registry row for a specialist agent (Phase 6).
+
+    Deliberately not a definition. What an agent *does* lives in code
+    (app/agents/); only what a user may change lives here, which today is
+    `enabled` alone. Putting prompts or behaviour in the database would put
+    executable intent behind a CRUD endpoint.
+    """
+
+    __tablename__ = "agents"
+
+    id: Mapped[uuid.UUID] = mapped_column(PgUuid, primary_key=True, default=uuid.uuid4)
+    name: Mapped[str] = mapped_column(String(40), nullable=False, unique=True)
+    description: Mapped[str] = mapped_column(Text, nullable=False)
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
+class AgentRun(Base):
+    """One agent invocation, recorded whatever happened to it.
+
+    The observability half of Phase 6 and the reason the phase is worth
+    anything: "why was that answer ungrounded" is only answerable if the
+    skips, timeouts and failures are in the table alongside the successes.
+
+    No foreign key to `agents`: an audit trail must outlive the registry row
+    it refers to, so deleting or renaming an agent does not erase the record
+    of what it did. `agent_name` is denormalised for the same reason.
+    """
+
+    __tablename__ = "agent_runs"
+
+    id: Mapped[uuid.UUID] = mapped_column(PgUuid, primary_key=True, default=uuid.uuid4)
+    user_id: Mapped[uuid.UUID] = mapped_column(PgUuid, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    agent_id: Mapped[uuid.UUID | None] = mapped_column(PgUuid, nullable=True)
+    agent_name: Mapped[str] = mapped_column(String(40), nullable=False)
+    conversation_id: Mapped[uuid.UUID | None] = mapped_column(
+        PgUuid, ForeignKey("conversations.id", ondelete="CASCADE"), nullable=True
+    )
+    input: Mapped[str] = mapped_column(Text, nullable=False)
+    output: Mapped[str | None] = mapped_column(Text, nullable=True)
+    #: "ok" | "failed" | "timeout" | "skipped"
+    status: Mapped[str] = mapped_column(String(20), nullable=False)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    #: Stored rather than derived from timestamps -- created_at is written by
+    #: the database clock at insert, which is after the work finished.
+    duration_ms: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        Index("ix_agent_runs_user_created", "user_id", "created_at"),
+        Index("ix_agent_runs_conversation_id", "conversation_id"),
     )
 
 
