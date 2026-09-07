@@ -52,9 +52,15 @@ export interface SpeechInput {
 export function useSpeechInput({
   onUtterance,
   onInterrupt,
+  onFatal,
 }: {
   onUtterance: (text: string) => void;
   onInterrupt: () => void;
+  /**
+   * Called when this backend cannot work at all in this browser, so the
+   * caller can fall back rather than showing an error and stopping.
+   */
+  onFatal?: (reason: string) => void;
 }): SpeechInput {
   const supported = useSyncExternalStore(NEVER_CHANGES, isSpeechInputSupported, UNSUPPORTED_ON_SERVER);
   const [enabled, setEnabled] = useState(false);
@@ -73,10 +79,12 @@ export function useSpeechInput({
   // call the current render's callbacks instead of the first render's.
   const onUtteranceRef = useRef(onUtterance);
   const onInterruptRef = useRef(onInterrupt);
+  const onFatalRef = useRef(onFatal);
   useEffect(() => {
     onUtteranceRef.current = onUtterance;
     onInterruptRef.current = onInterrupt;
-  }, [onUtterance, onInterrupt]);
+    onFatalRef.current = onFatal;
+  }, [onUtterance, onInterrupt, onFatal]);
 
   // Built on first use rather than during render: it closes over refs, and
   // reading a ref while rendering is exactly what react-hooks/refs forbids.
@@ -130,10 +138,26 @@ export function useSpeechInput({
         case "service-not-allowed":
           wantListeningRef.current = false;
           setEnabled(false);
+          // Not a fallback case: permission was refused, and the recorder
+          // path needs the same permission, so switching would just fail
+          // again with a less clear message.
           setError("Microphone access was blocked. Allow it in the browser's site settings, then try again.");
           break;
         case "network":
-          setError("Speech recognition needs a network connection and could not reach the service.");
+          // Almost never the user's network. Outside Google Chrome this API
+          // frequently exists and always fails this way: Chromium forks ship
+          // the interface without Google's speech backend credentials, so
+          // every attempt reaches nothing. The old message blamed the
+          // connection and sent people to check their wifi.
+          //
+          // Reported through onUnsupported so the caller can switch to the
+          // recorder-based path instead of leaving the user with an error.
+          wantListeningRef.current = false;
+          setEnabled(false);
+          setError(
+            "This browser's speech service is unreachable — common outside Google Chrome. Switching to server transcription."
+          );
+          onFatalRef.current?.("network");
           break;
         default:
           setError(`Speech recognition failed (${event.error}).`);

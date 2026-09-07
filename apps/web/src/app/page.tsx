@@ -9,6 +9,7 @@ import PersonaSwitcher from "@/components/PersonaSwitcher";
 import VoiceControls, { type VoiceState } from "@/components/VoiceControls";
 import ModelChip from "@/components/ModelChip";
 import { useSpeechInput, useSpeechOutput } from "@/hooks/useVoice";
+import { useWhisperInput } from "@/hooks/useWhisperInput";
 import { matchWakePhrase, WAKE_FOLLOW_UP_MS } from "@/lib/speech";
 import { useScreenShare } from "@/hooks/useScreenShare";
 import {
@@ -77,6 +78,20 @@ export default function Home() {
   // server-side can see the screen, and a frame is only ever taken at
   // the moment a question is asked.
   const screen = useScreenShare();
+
+  // Which speech backend is in use. The browser's is tried first because it
+  // is instant and free; the recorder path costs a round trip per utterance
+  // but works in browsers where the browser's own service does not exist or
+  // cannot be reached -- which is most of them outside Google Chrome.
+  const [sttBackend, setSttBackend] = useState<"browser" | "whisper">("browser");
+  // Set when the browser backend failed mid-attempt, so the replacement can
+  // pick up where it left off. The user clicked the microphone once; making
+  // them click again after a failure they did not cause is friction with no
+  // purpose.
+  //
+  // A ref, not state: nothing renders from it, and clearing it inside the
+  // effect below would be a synchronous setState in an effect body.
+  const resumeOnFallbackRef = useRef(false);
 
   // Hands-free: ignore everything until addressed by name. Opt-in per
   // session and never persisted -- see WAKE_WORD in @/lib/speech for why
@@ -168,8 +183,10 @@ export default function Home() {
     return true;
   }
 
-  const mic = useSpeechInput({
-    onUtterance: (text) => {
+  // Both hooks are always mounted: React requires a stable hook order, and
+  // whichever is not selected simply never gets started, so it holds no
+  // microphone and does no work.
+  const handleUtterance = (text: string) => {
       // Barge-in: talking over the assistant stops it, rather than queueing
       // a reply behind a paragraph you already interrupted.
       speech.cancel();
@@ -201,9 +218,41 @@ export default function Home() {
         if (await handleSpokenCommand(spoken)) return;
         await handleSend(spoken);
       })();
+  };
+
+  const handleInterrupt = () => speech.cancel();
+
+  const browserMic = useSpeechInput({
+    onUtterance: handleUtterance,
+    onInterrupt: handleInterrupt,
+    // The browser's speech service is unreachable in this browser. Switch
+    // rather than surface an error: the user asked to talk, and there is a
+    // backend that works.
+    onFatal: () => {
+      setSttBackend("whisper");
+      resumeOnFallbackRef.current = true;
+      setNotice(
+        "This browser's speech service is unavailable, so speech is now being transcribed on the server instead."
+      );
     },
-    onInterrupt: () => speech.cancel(),
   });
+
+  const whisperMic = useWhisperInput({
+    onUtterance: handleUtterance,
+    onInterrupt: handleInterrupt,
+  });
+
+  const mic = sttBackend === "whisper" ? whisperMic : browserMic;
+
+  // Start the replacement once it is the selected backend. Done in an effect
+  // rather than inside onFatal because the switch is a state change: at the
+  // moment onFatal runs, `mic` is still the backend that just failed, and
+  // starting it again would fail again.
+  useEffect(() => {
+    if (sttBackend !== "whisper" || !resumeOnFallbackRef.current) return;
+    resumeOnFallbackRef.current = false;
+    whisperMic.start();
+  }, [sttBackend, whisperMic]);
 
   useEffect(() => {
     suspendMicRef.current = mic.suspend;

@@ -528,3 +528,42 @@ export async function askAboutImage(
   }
   return response.json() as Promise<VisionResult>;
 }
+
+// --- Speech to text without the browser's speech service --------------
+
+// Posts one recorded utterance and returns what was said. Multipart, so it
+// bypasses request<T>() for the same reason uploadDocument does.
+//
+// The filename matters: it carries the container format, which is how the
+// transcription service knows how to decode the audio. Passing a generic
+// name makes valid audio look corrupt.
+export async function transcribe(blob: Blob, language?: string): Promise<string> {
+  const extension = blob.type.includes("ogg")
+    ? "ogg"
+    : blob.type.includes("mp4")
+      ? "mp4"
+      : blob.type.includes("wav")
+        ? "wav"
+        : "webm";
+
+  const form = new FormData();
+  form.append("audio", blob, `utterance.${extension}`);
+  if (language) form.append("language", language);
+
+  let response: Response;
+  try {
+    response = await fetch(`${API_BASE_URL}/voice/transcribe`, { method: "POST", body: form });
+  } catch {
+    throw new ApiError(0, `Could not reach the backend. Is it running on ${API_BASE_URL}?`);
+  }
+  if (!response.ok) {
+    let detail = response.statusText;
+    try {
+      detail = (await response.json()).detail ?? detail;
+    } catch {
+      // not JSON; keep statusText
+    }
+    throw new ApiError(response.status, detail);
+  }
+  return ((await response.json()) as { text: string }).text;
+}
