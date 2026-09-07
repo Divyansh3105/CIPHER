@@ -322,6 +322,8 @@ The recorder path has to solve something the browser API solved for free — kno
 
 It is also the more private of the two. The browser API streams audio to Google continuously while the microphone is open; this sends one clip per utterance to a provider the project already talks to.
 
+Preflight covers the chain, per the rule that the harness grows one check per real incident: the endpoint's provider round trip is exercised with a generated WAV rather than a committed fixture, and a sub-minimum clip is asserted to return empty text with 200 — a recorder that opens and closes on silence is normal operation, and erroring there would switch the microphone off mid-conversation.
+
 ---
 
 ## 9. Computer Control System (Phase 7+, Safety-Critical)

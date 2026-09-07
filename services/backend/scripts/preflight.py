@@ -16,6 +16,9 @@ live-only:
     pre-retrieval version of the chat endpoint.
   * Phase 4: `/memory/graph` answering with the previous revision's response
     schema after an edit, for the same reason.
+  * After Phase 8: speech input failing in every browser that is not Google
+    Chrome, reported by a user as a network error. The fallback that fixes it
+    is a live provider round trip, so only a live check can prove it works.
 
 Green unit tests are not evidence the system works. This is.
 
@@ -33,9 +36,13 @@ Exits non-zero if any check fails.
 """
 import argparse
 import asyncio
+import io
+import math
+import struct
 import subprocess
 import sys
 import time
+import wave
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -677,6 +684,61 @@ async def check_model_swap(client: httpx.AsyncClient, report: Report) -> None:
         await client.delete("/models/active")
 
 
+def _tone_wav(seconds: float) -> bytes:
+    """A real WAV, generated rather than committed as a fixture.
+
+    What is in it does not matter -- Whisper is free to hear nothing in a
+    440Hz tone. The check is that the round trip happens at all: the route
+    is served, the key is accepted, the model id still exists, and the
+    response parses. A binary fixture would prove the same thing and would
+    have to be carried in the repo.
+    """
+    rate = 16000
+    buffer = io.BytesIO()
+    with wave.open(buffer, "wb") as out:
+        out.setnchannels(1)
+        out.setsampwidth(2)
+        out.setframerate(rate)
+        frames = [
+            struct.pack("<h", int(12000 * math.sin(2 * math.pi * 440 * i / rate)))
+            for i in range(int(rate * seconds))
+        ]
+        out.writeframes(b"".join(frames))
+    return buffer.getvalue()
+
+
+async def check_speech_to_text(client: httpx.AsyncClient, report: Report) -> None:
+    section("Speech to text")
+
+    # A clip too short to contain speech must come back empty with 200. It is
+    # normal operation -- a recorder opening and closing on silence -- and an
+    # error here would switch the user's microphone off mid-conversation.
+    tiny = await client.post(
+        "/voice/transcribe",
+        files={"audio": ("tiny.wav", _tone_wav(0.01), "audio/wav")},
+    )
+    if tiny.status_code == 200 and tiny.json()["text"] == "":
+        report.ok("a clip too short to hold speech is not an error")
+    else:
+        report.fail(
+            "a clip too short to hold speech is not an error",
+            f"expected 200 with empty text, got {tiny.status_code} {tiny.text[:100]}",
+        )
+
+    clip = await client.post(
+        "/voice/transcribe",
+        files={"audio": ("preflight.wav", _tone_wav(1.0), "audio/wav")},
+        timeout=60.0,
+    )
+    if clip.status_code == 200 and clip.json().get("model_used"):
+        report.ok("POST /voice/transcribe", clip.json()["model_used"])
+    else:
+        report.fail(
+            "POST /voice/transcribe",
+            f"{clip.status_code} {clip.text[:160]}",
+        )
+
+
 async def check_secrets(report: Report) -> None:
     section("Secrets")
     env_file = REPO_ROOT / ".env"
@@ -820,6 +882,7 @@ async def main(all_models: bool, skip_llm: bool) -> int:
             await check_agents(client, report)
             await check_automation_safety(client, report)
             await check_model_swap(client, report)
+            await check_speech_to_text(client, report)
             await cleanup(report)
         print(f"\nfinished in {time.monotonic() - started:.1f}s")
 
