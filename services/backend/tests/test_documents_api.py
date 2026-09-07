@@ -1,10 +1,12 @@
-"""POST/GET/DELETE /documents, and GET /tools."""
-from uuid import uuid4
+"""POST/GET/DELETE /documents, GET /documents/{id}/chunks, and GET /tools."""
+from uuid import UUID, uuid4
 
 import pytest
 
 from app.api.deps import get_current_user_id
+from app.core.database import get_session_factory
 from app.main import app
+from app.models.db import DocumentChunk
 
 
 def _upload(client, name="notes.txt", body=b"CIPHER runs on free tiers only."):
@@ -121,6 +123,87 @@ async def test_another_users_document_is_invisible_and_undeletable(client):
     assert listing.json() == []
     # 404 rather than 403: don't reveal that it exists.
     assert delete.status_code == 404
+
+
+# --- GET /documents/{id}/chunks -----------------------------------------
+
+
+async def _add_chunks(document_id, *, embedded_flags):
+    """Insert passages straight into the database the endpoint reads.
+
+    Deliberately NOT through the document store: the store is faked in tests
+    (InMemoryDocumentStore), so going through it would prove only that the
+    fake remembers what it was told. The endpoint runs a real query, so the
+    rows have to really be there.
+    """
+    session_factory = app.dependency_overrides[get_session_factory]()
+    user_id = app.dependency_overrides[get_current_user_id]()
+    async with session_factory() as session:
+        for index, embedded in enumerate(embedded_flags):
+            session.add(
+                DocumentChunk(
+                    document_id=UUID(str(document_id)),
+                    user_id=user_id,
+                    content=f"passage {index}",
+                    chunk_index=index,
+                    page_number=index + 1,
+                    embedding=[0.1] * 768 if embedded else None,
+                )
+            )
+        await session.commit()
+
+
+async def test_chunks_come_back_in_document_order_with_page_numbers(client):
+    """A citation says "page 4"; this is where you go to read page 4.
+
+    Order is document order, not insertion order or similarity: the panel is
+    for reading a file, not for ranking it.
+    """
+    created = await _upload(client)
+    document_id = created.json()["document"]["id"]
+    await _add_chunks(document_id, embedded_flags=[True, True, True])
+
+    response = await client.get(f"/documents/{document_id}/chunks")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert [c["chunk_index"] for c in body] == [0, 1, 2]
+    assert [c["page_number"] for c in body] == [1, 2, 3]
+    assert body[0]["content"] == "passage 0"
+
+
+async def test_a_passage_with_no_embedding_says_so(client):
+    """Stored but never embedded is a real state, and it is invisible from
+    the outside: the passage is in the document and can never be retrieved.
+    Reporting it as an ordinary passage would make the panel lie about what
+    the assistant can actually quote.
+    """
+    created = await _upload(client)
+    document_id = created.json()["document"]["id"]
+    await _add_chunks(document_id, embedded_flags=[True, False])
+
+    body = (await client.get(f"/documents/{document_id}/chunks")).json()
+
+    assert [c["embedded"] for c in body] == [True, False]
+
+
+async def test_chunks_of_an_unknown_document_are_404(client):
+    assert (await client.get(f"/documents/{uuid4()}/chunks")).status_code == 404
+
+
+async def test_another_users_chunks_are_not_readable(client):
+    created = await _upload(client)
+    document_id = created.json()["document"]["id"]
+    await _add_chunks(document_id, embedded_flags=[True])
+
+    app.dependency_overrides[get_current_user_id] = lambda: uuid4()
+    try:
+        response = await client.get(f"/documents/{document_id}/chunks")
+    finally:
+        app.dependency_overrides.pop(get_current_user_id, None)
+
+    # 404 rather than 403, matching delete: don't reveal that it exists.
+    assert response.status_code == 404
 
 
 # --- GET /tools ---------------------------------------------------------

@@ -335,6 +335,63 @@ async def check_chat_and_memory(client: httpx.AsyncClient, report: Report) -> No
             await client.delete(f"/memory/{memory_id}")
 
 
+async def check_conversation_delete(client: httpx.AsyncClient, report: Report) -> None:
+    """DELETE /chat/conversations/{id}, against real Postgres.
+
+    Worth a live check rather than trusting the unit tests: those run on
+    SQLite, which does not enforce the ON DELETE CASCADE that this endpoint
+    deliberately works around by detaching agent_runs first. On Postgres the
+    cascade is real, so "the runs survived" is only actually proven here.
+    """
+    section("Deleting a conversation")
+
+    created = await client.post(
+        "/chat/message",
+        json={"content": f"Reply with the single word ok. ({MARKER} delete check)"},
+        timeout=90.0,
+    )
+    if created.status_code != 200:
+        report.fail("create a conversation to delete", f"{created.status_code} {created.text[:120]}")
+        return
+    conversation_id = created.json()["conversation_id"]
+    remember_conversation(created.json())
+
+    runs_before = len((await client.get("/agents/runs")).json())
+
+    response = await client.delete(f"/chat/conversations/{conversation_id}")
+    if response.status_code != 200:
+        report.fail("DELETE /chat/conversations/{id}", f"{response.status_code} {response.text[:120]}")
+        return
+    body = response.json()
+    report.ok(
+        "DELETE /chat/conversations/{id}",
+        f"{body['messages_removed']} messages removed, {body['agent_runs_detached']} runs detached",
+    )
+
+    gone = await client.get(f"/chat/conversations/{conversation_id}")
+    if gone.status_code == 404:
+        report.ok("the conversation is actually gone")
+    else:
+        report.fail("the conversation is actually gone", f"GET returned {gone.status_code}")
+
+    listing = [c["id"] for c in (await client.get("/chat/conversations")).json()]
+    if conversation_id not in listing:
+        report.ok("it is out of the history list")
+    else:
+        report.fail("it is out of the history list", "still listed after delete")
+
+    # The point of detaching rather than cascading: the activity trail keeps
+    # its record of what ran, even for a chat that no longer exists.
+    runs_after = len((await client.get("/agents/runs")).json())
+    if runs_after >= runs_before:
+        report.ok("agent runs survived the delete", f"{runs_after} runs still recorded")
+    else:
+        report.fail(
+            "agent runs survived the delete",
+            f"{runs_before} runs before, {runs_after} after -- the cascade took audit rows",
+        )
+
+
 async def check_memory_graph(client: httpx.AsyncClient, report: Report) -> None:
     """Exercise the graph query against real pgvector.
 
@@ -454,9 +511,43 @@ async def check_tools_and_rag(client: httpx.AsyncClient, report: Report) -> None
             report.fail("document ingestion", f"status={status} error={error}")
             return
 
+        # The passage list behind the documents dashboard's right-hand pane.
+        # Worth a live check specifically because the unit tests exercise it
+        # against SQLite: this is the query that has to survive real
+        # Postgres, and `embedding IS NOT NULL` on a `vector` column is
+        # exactly the kind of thing a fake never proves.
+        passages = await client.get(f"/documents/{document_id}/chunks")
+        if passages.status_code != 200:
+            report.fail("GET /documents/{id}/chunks", f"{passages.status_code} {passages.text[:120]}")
+        else:
+            rows = passages.json()
+            if len(rows) != chunks:
+                report.fail(
+                    "passage list matches the chunk count",
+                    f"{len(rows)} passages listed but chunk_count is {chunks}",
+                )
+            elif [r["chunk_index"] for r in rows] != sorted(r["chunk_index"] for r in rows):
+                report.fail("passages are in document order", "chunk_index is not ascending")
+            elif not all(r["embedded"] for r in rows):
+                # Every passage of a "ready" document was embedded, or the
+                # document should not be ready. A False here means the
+                # dashboard would show a passage CIPHER cannot actually quote.
+                report.fail(
+                    "every passage of a ready document is embedded",
+                    f"{sum(1 for r in rows if not r['embedded'])} of {len(rows)} have no vector",
+                )
+            else:
+                report.ok(
+                    "GET /documents/{id}/chunks",
+                    f"{len(rows)} passages, in order, all embedded",
+                )
+
         answer = await client.post(
             "/chat/message",
-            json={"content": f"What is the internal project codename for the archival subsystem, according to my uploaded documents?"},
+            json={
+                "content": "What is the internal project codename for the archival subsystem, "
+                f"according to my uploaded documents? ({MARKER})"
+            },
             timeout=120.0,
         )
         if answer.status_code != 200:
@@ -895,6 +986,7 @@ async def main(all_models: bool, skip_llm: bool) -> int:
             await check_llm(report, all_models)
             await check_embeddings(report)
             await check_chat_and_memory(client, report)
+            await check_conversation_delete(client, report)
             await check_memory_graph(client, report)
             await check_tools_and_rag(client, report)
             await check_agents(client, report)

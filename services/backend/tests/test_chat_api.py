@@ -1,4 +1,4 @@
-"""Integration tests for POST /chat/message and GET /chat/conversations[/{id}].
+"""Integration tests for POST /chat/message and GET/DELETE /chat/conversations[/{id}].
 
 Uses an in-memory SQLite DB (see app/models/db.py for why the ORM types are
 dialect-portable) and a fake LLM provider, so this needs no network or real
@@ -228,6 +228,70 @@ async def test_sending_a_message_bumps_conversation_to_top_of_the_list(client):
 
 
 # --- GET /personas -------------------------------------------------------
+
+
+# --- DELETE /chat/conversations/{id} ------------------------------------
+
+
+async def test_deleting_a_conversation_removes_it_and_its_messages(client):
+    created = await client.post("/chat/message", json={"content": "Hello JARVIS"})
+    conversation_id = created.json()["conversation_id"]
+
+    response = await client.delete(f"/chat/conversations/{conversation_id}")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["deleted"] == 1
+    # The user turn and the assistant reply.
+    assert body["messages_removed"] == 2
+    assert (await client.get("/chat/conversations")).json() == []
+    assert (await client.get(f"/chat/conversations/{conversation_id}")).status_code == 404
+
+
+async def test_deleting_a_conversation_keeps_its_agent_runs(client):
+    """The activity trail must survive a chat being tidied up.
+
+    agent_runs.conversation_id cascades at the schema level, so this would
+    quietly delete audit rows if the endpoint did not detach them first.
+    Phase 6's rule is that every run is recorded -- including the ones that
+    explain a bad answer -- and "the conversation was deleted" is not a
+    reason for the record of what ran to disappear.
+    """
+    created = await client.post("/chat/message", json={"content": "Hello JARVIS"})
+    conversation_id = created.json()["conversation_id"]
+    runs_before = (await client.get("/agents/runs")).json()
+
+    delete_response = await client.delete(f"/chat/conversations/{conversation_id}")
+
+    runs_after = (await client.get("/agents/runs")).json()
+    assert len(runs_after) == len(runs_before)
+    assert delete_response.json()["agent_runs_detached"] == len(runs_before)
+    # Detached, not orphaned into a dangling reference.
+    assert all(run["conversation_id"] is None for run in runs_after)
+
+
+async def test_deleting_an_unknown_conversation_is_404(client):
+    assert (await client.delete(f"/chat/conversations/{uuid4()}")).status_code == 404
+
+
+async def test_another_users_conversation_cannot_be_deleted(client):
+    created = await client.post("/chat/message", json={"content": "Hello JARVIS"})
+    conversation_id = created.json()["conversation_id"]
+
+    # Restore the fixture's override rather than popping it: popping leaves
+    # the real dependency in place, so the assertion below would run as a
+    # third user and see an empty list for the wrong reason.
+    owner = app.dependency_overrides[get_current_user_id]
+    app.dependency_overrides[get_current_user_id] = lambda: uuid4()
+    try:
+        response = await client.delete(f"/chat/conversations/{conversation_id}")
+    finally:
+        app.dependency_overrides[get_current_user_id] = owner
+
+    # 404 rather than 403: don't reveal that it exists.
+    assert response.status_code == 404
+    # And it is still there for its actual owner.
+    assert len((await client.get("/chat/conversations")).json()) == 1
 
 
 async def test_list_personas_returns_all_three(client):
