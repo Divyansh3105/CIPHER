@@ -72,8 +72,28 @@ jobs:
       - name: Lint
         run: npm run lint
 
+      - name: Generate route types
+        # `next-env.d.ts` imports `.next/types/routes.d.ts`, and `next build`
+        # is what writes it. Locally that file is always already there from a
+        # previous build, so the typecheck passes and the dependency is
+        # invisible; on a clean checkout it does not exist and every route
+        # type -- `LayoutProps`, `PageProps` -- is an unresolved name.
+        #
+        # Generating them explicitly rather than moving the typecheck after
+        # the build, so a type error still fails before the slowest step
+        # rather than inside it.
+        run: npx next typegen
+
       - name: Typecheck
         run: npx tsc --noEmit
+
+      - name: Voice detector checks
+        # The frontend's only test, and the reason it is worth a CI step: the
+        # server-transcription path it covers only runs where the browser's
+        # own speech service fails, so it is invisible from Chrome and from
+        # every manual pass someone does there. Needs no browser and no
+        # microphone -- it drives the detector with synthesised audio.
+        run: npm run vad
 
       - name: Build
         # The build is the check that catches what lint and tsc cannot --
