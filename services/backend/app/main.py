@@ -13,6 +13,7 @@ from app.api.memory import router as memory_router
 from app.api.models import router as models_router
 from app.api.tools import router as tools_router
 from app.api.vision import router as vision_router
+from app.api.voice import router as voice_router
 from app.api.personas import router as personas_router
 from app.core.config import get_settings
 
@@ -37,6 +38,7 @@ app.include_router(tools_router)
 app.include_router(agents_router)
 app.include_router(automation_router)
 app.include_router(vision_router)
+app.include_router(voice_router)
 app.include_router(personas_router)
 
 

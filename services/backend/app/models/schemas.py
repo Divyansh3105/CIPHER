@@ -186,6 +186,13 @@ class VisionResponse(BaseModel):
     model_used: str
 
 
+class TranscriptionResponse(BaseModel):
+    #: Empty when the clip was too short to contain speech. Not an error --
+    #: a recorder that opened and shut on a stray click is a non-event.
+    text: str
+    model_used: str
+
+
 # --- Phase 6: agents -----------------------------------------------------
 
 
