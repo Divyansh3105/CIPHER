@@ -15,7 +15,28 @@
 // returns null so the caller must say the share ended rather than answering
 // from a stale image.
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
+
+// Capability detection read through useSyncExternalStore rather than
+// computed in render. The same pattern useVoice.ts uses, and for the same
+// reason -- which this hook originally ignored and paid for: a plain
+// `typeof navigator !== "undefined"` returns false on the server and true
+// on the client, so the screen-share controls were absent from the
+// server-rendered HTML and present on the first client render. React calls
+// that a hydration mismatch and throws away the tree.
+//
+// Returning false as the server snapshot is honest rather than a
+// workaround: a server genuinely cannot share a screen. The client
+// corrects it immediately after hydration.
+const NEVER_CHANGES = () => () => {};
+const UNSUPPORTED_ON_SERVER = () => false;
+
+function isScreenShareSupported(): boolean {
+  return (
+    typeof navigator !== "undefined" &&
+    typeof navigator.mediaDevices?.getDisplayMedia === "function"
+  );
+}
 
 export interface ScreenShare {
   supported: boolean;
@@ -33,9 +54,11 @@ export function useScreenShare(): ScreenShare {
   const streamRef = useRef<MediaStream | null>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
 
-  const supported =
-    typeof navigator !== "undefined" &&
-    typeof navigator.mediaDevices?.getDisplayMedia === "function";
+  const supported = useSyncExternalStore(
+    NEVER_CHANGES,
+    isScreenShareSupported,
+    UNSUPPORTED_ON_SERVER
+  );
 
   const stop = useCallback(() => {
     streamRef.current?.getTracks().forEach((track) => track.stop());
