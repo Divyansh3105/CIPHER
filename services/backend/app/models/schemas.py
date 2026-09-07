@@ -268,6 +268,24 @@ class DocumentOut(BaseModel):
     model_config = {"from_attributes": True}
 
 
+class DocumentChunkOut(BaseModel):
+    """One extracted passage, as the documents dashboard shows it.
+
+    `page_number` is None for formats that have no pages (plain text,
+    Markdown). Where it is set it is trustworthy for one structural reason:
+    chunks never span pages, so "page 4" names exactly one page.
+    """
+
+    id: UUID
+    chunk_index: int
+    page_number: int | None
+    content: str
+    #: False when ingestion stored the passage but never embedded it. Such a
+    #: passage is in the document and can never be retrieved, which the
+    #: dashboard has to be able to say rather than imply.
+    embedded: bool
+
+
 class DocumentUploadResponse(BaseModel):
     document: DocumentOut
     #: True when this file was already uploaded (same extracted text) and no

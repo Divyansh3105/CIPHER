@@ -3,7 +3,7 @@ import logging
 from uuid import UUID
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
-from sqlalchemy import select
+from sqlalchemy import delete, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import selectinload
 
@@ -16,7 +16,7 @@ from app.llm.router import LLMRouter, get_llm_router
 from app.memory.capture import MemoryWriter, get_memory_writer
 from app.memory.embedder import Embedder, EmbeddingError, get_embedder
 from app.memory.store import MemoryStore, get_memory_store
-from app.models.db import Conversation, Message
+from app.models.db import AgentRun, Conversation, Message
 from app.models.schemas import (
     ChatMessageRequest,
     ChatMessageResponse,
@@ -321,3 +321,48 @@ async def get_conversation(
         updated_at=conversation.updated_at,
         messages=[MessageOut.model_validate(m) for m in conversation.messages],
     )
+
+
+@router.delete("/conversations/{conversation_id}")
+async def delete_conversation(
+    conversation_id: UUID,
+    session: AsyncSession = Depends(get_session),
+    user_id: UUID = Depends(get_current_user_id),
+) -> dict[str, int]:
+    """Delete a conversation and its messages.
+
+    Two details that are choices, not incidentals:
+
+    `messages` would go with it through ON DELETE CASCADE, but deleting them
+    explicitly keeps the SQLite test path (which does not enforce cascades)
+    behaving the same as Postgres, and makes the count reportable. Same
+    reasoning as delete_document in app/api/documents.py.
+
+    `agent_runs` are DETACHED rather than deleted, even though their foreign
+    key cascades. The activity trail exists to answer "why did it answer that
+    way", and Phase 6's rule is that it records every run including the ones
+    that did nothing -- an audit view that quietly loses rows because an
+    unrelated chat was tidied up is the thing that rule is against. Nulling
+    the column first means the cascade has nothing left to take.
+    """
+    conversation = await _get_owned_conversation(session, conversation_id, user_id)
+
+    detached = await session.execute(
+        update(AgentRun)
+        .where(AgentRun.conversation_id == conversation.id)
+        .values(conversation_id=None)
+    )
+    removed = await session.execute(
+        delete(Message).where(Message.conversation_id == conversation.id)
+    )
+    await session.delete(conversation)
+    await session.commit()
+
+    # 200 with a body rather than 204: apps/web/src/lib/api.ts's request<T>()
+    # calls response.json() unconditionally, and an empty 204 would throw a
+    # raw SyntaxError the frontend's error banner cannot catch.
+    return {
+        "deleted": 1,
+        "messages_removed": removed.rowcount or 0,
+        "agent_runs_detached": detached.rowcount or 0,
+    }

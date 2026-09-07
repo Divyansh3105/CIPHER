@@ -20,8 +20,8 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from app.api.deps import get_current_user_id
 from app.core.database import get_session, get_session_factory
 from app.core.ratelimit import UPLOAD_RULE, RateLimiter, get_rate_limiter
-from app.models.db import Document
-from app.models.schemas import DocumentOut, DocumentUploadResponse
+from app.models.db import Document, DocumentChunk
+from app.models.schemas import DocumentChunkOut, DocumentOut, DocumentUploadResponse
 from app.rag.extract import MAX_UPLOAD_BYTES, SUPPORTED_EXTENSIONS, ExtractionError, extract
 from app.rag.ingest import DocumentIngestor, get_document_ingestor
 from app.rag.store import DocumentStore, get_document_store, get_owned_document
@@ -135,6 +135,52 @@ async def upload_document(
     )
 
     return DocumentUploadResponse(document=DocumentOut.model_validate(document), deduplicated=False)
+
+
+@router.get("/{document_id}/chunks", response_model=list[DocumentChunkOut])
+async def list_document_chunks(
+    document_id: UUID,
+    session: AsyncSession = Depends(get_session),
+    user_id: UUID = Depends(get_current_user_id),
+) -> list[DocumentChunkOut]:
+    """The passages a document was split into, in document order.
+
+    This is what makes the dashboard's claim checkable: a citation says
+    "handbook.pdf, page 4", and this endpoint is where you go to read the
+    passage that page number refers to and confirm the answer came from it.
+
+    The embedding vector is never selected -- only whether one exists. The
+    column is deferred because asyncpg has no codec for `vector` (see the
+    NOTE on DocumentChunk.embedding), and `IS NOT NULL` is answered in SQL
+    without the value ever crossing the wire.
+    """
+    document = await get_owned_document(session, document_id=document_id, user_id=user_id)
+    if document is None:
+        # 404 rather than 403, matching delete_document below: don't reveal
+        # that another user's document exists.
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    result = await session.execute(
+        select(
+            DocumentChunk.id,
+            DocumentChunk.chunk_index,
+            DocumentChunk.page_number,
+            DocumentChunk.content,
+            DocumentChunk.embedding.is_not(None),
+        )
+        .where(DocumentChunk.document_id == document_id)
+        .order_by(DocumentChunk.chunk_index)
+    )
+    return [
+        DocumentChunkOut(
+            id=row[0],
+            chunk_index=row[1],
+            page_number=row[2],
+            content=row[3],
+            embedded=bool(row[4]),
+        )
+        for row in result.all()
+    ]
 
 
 @router.delete("/{document_id}")
