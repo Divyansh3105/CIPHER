@@ -44,6 +44,7 @@ import sys
 import time
 import wave
 from pathlib import Path
+from uuid import UUID
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -65,6 +66,23 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 # leavings and a human reading the dashboard knows where a stray row came
 # from.
 MARKER = "cipher-preflight"
+
+# Conversation ids this run created, so cleanup can delete exactly those.
+#
+# Cleanup used to find them by matching message CONTENT ("%archival
+# subsystem%", "%verification codeword%"). That is a pattern over the user's
+# real data, and it did what patterns over real data do: a genuine
+# conversation that happened to discuss the same subject as a probe question
+# matched, and was deleted. Ids are not a heuristic -- a conversation is
+# either one this run made or it is not.
+CREATED_CONVERSATIONS: set[str] = set()
+
+
+def remember_conversation(payload: dict) -> None:
+    """Record a conversation this run created, for scoped cleanup."""
+    conversation_id = payload.get("conversation_id")
+    if conversation_id:
+        CREATED_CONVERSATIONS.add(str(conversation_id))
 
 
 class Report:
@@ -285,13 +303,14 @@ async def check_chat_and_memory(client: httpx.AsyncClient, report: Report) -> No
 
         reply = await client.post(
             "/chat/message",
-            json={"content": "What is my verification codeword?"},
+            json={"content": f"What is my verification codeword? ({MARKER})"},
             timeout=90.0,
         )
         if reply.status_code != 200:
             report.fail("chat replies", f"POST /chat/message returned {reply.status_code} {reply.text[:120]}")
             return
         payload = reply.json()
+        remember_conversation(payload)
         report.ok("chat replies", f"on {payload['model_used']}")
 
         recalled = payload["message"].get("recalled_memories", [])
@@ -445,6 +464,7 @@ async def check_tools_and_rag(client: httpx.AsyncClient, report: Report) -> None
             return
 
         payload = answer.json()
+        remember_conversation(payload)
         citations = payload["message"].get("citations", [])
         cited = [c for c in citations if c.get("kind") == "document"]
 
@@ -522,6 +542,7 @@ async def check_agents(client: httpx.AsyncClient, report: Report) -> None:
         return
 
     payload = answer.json()
+    remember_conversation(payload)
     if payload.get("agent_used") == "coding":
         report.ok("a coding question routes to the coding agent")
     else:
@@ -799,15 +820,30 @@ async def cleanup(report: Report) -> None:
                 text("DELETE FROM memories WHERE content LIKE :pattern"), {"pattern": f"%{MARKER}%"}
             )
             removed_memories = result.rowcount or 0
+            # Exactly the conversations this run created -- see
+            # CREATED_CONVERSATIONS. Never a content match: the previous
+            # version deleted real conversations that merely discussed the
+            # same topic as a probe question.
+            removed_conversations = 0
+            if CREATED_CONVERSATIONS:
+                result = await session.execute(
+                    text("DELETE FROM conversations WHERE id = ANY(:ids)"),
+                    {"ids": [UUID(cid) for cid in CREATED_CONVERSATIONS]},
+                )
+                removed_conversations = result.rowcount or 0
+            # And anything a PREVIOUS run left behind by dying before it got
+            # here. Matched on MARKER, which every probe message carries and
+            # no human types -- not on the topic of the question, which is
+            # what made the old sweep delete real conversations.
             result = await session.execute(
                 text(
-                    "DELETE FROM conversations WHERE title ILIKE :pattern OR id IN ("
-                    "  SELECT conversation_id FROM messages WHERE content ILIKE :pattern"
+                    "DELETE FROM conversations WHERE id IN ("
+                    "  SELECT conversation_id FROM messages WHERE content LIKE :pattern"
                     ")"
                 ),
-                {"pattern": "%verification codeword%"},
+                {"pattern": f"%{MARKER}%"},
             )
-            removed_conversations = result.rowcount or 0
+            removed_conversations += result.rowcount or 0
             # A run that died between upload and delete leaves a document
             # behind; sweep those too rather than accumulating one per crash.
             result = await session.execute(
@@ -828,24 +864,6 @@ async def cleanup(report: Report) -> None:
                 {"uid": get_settings().dev_user_id},
             )
             removed_grants = result.rowcount or 0
-            result = await session.execute(
-                text(
-                    "DELETE FROM conversations WHERE id IN ("
-                    "  SELECT conversation_id FROM messages WHERE content ILIKE :pattern"
-                    ")"
-                ),
-                {"pattern": "%archival subsystem%"},
-            )
-            removed_conversations += result.rowcount or 0
-            result = await session.execute(
-                text(
-                    "DELETE FROM conversations WHERE id IN ("
-                    "  SELECT conversation_id FROM messages WHERE content ILIKE :pattern"
-                    ")"
-                ),
-                {"pattern": f"%{MARKER.replace('-', '_')}_add%"},
-            )
-            removed_conversations += result.rowcount or 0
             await session.commit()
         report.ok(
             "test data removed",
