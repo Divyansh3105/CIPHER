@@ -47,7 +47,36 @@ export interface SpeechInput {
   /** Cut the mic while the assistant talks, so it can't hear itself. */
   suspend: () => void;
   resume: () => void;
+
+  // --- Only the server-transcription path can answer these --------------
+  //
+  // Optional rather than stubbed, because a browser recogniser genuinely has
+  // no access to the audio: `webkitSpeechRecognition` hands back words and
+  // nothing else -- no samples, no level, no device. Faking a meter there
+  // would mean drawing a bar that is not measuring anything, which is worse
+  // than not drawing one. The UI renders these only when they are present.
+
+  /** Smoothed 0..1 input level, for a meter that proves the mic is live. */
+  level?: number;
+  /** Selectable audio inputs, populated once permission has been granted. */
+  devices?: { id: string; label: string }[];
+  deviceId?: string | null;
+  setDeviceId?: (id: string | null) => void;
+  /** Measured noise floor, or null while still calibrating. */
+  noiseFloor?: number | null;
 }
+
+/**
+ * How long to wait before restarting the recogniser after it ends.
+ *
+ * Chrome ends recognition on its own constantly, and restarting instantly is
+ * normally right. But when it ends *because* it is failing -- a revoked
+ * permission, a speech service that is refusing -- instant restart is a tight
+ * loop between `onend` and `onerror` that pins a core and floods the console.
+ * A short delay makes the failing case merely wrong instead of hostile, and
+ * is imperceptible in the normal one.
+ */
+const RESTART_DELAY_MS = 250;
 
 export function useSpeechInput({
   onUtterance,
@@ -74,6 +103,7 @@ export function useSpeechInput({
   // silence, so `onend` has to know whether that was intentional.
   const wantListeningRef = useRef(false);
   const suspendedRef = useRef(false);
+  const restartTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Held in refs so the recogniser's handlers, which are attached once, always
   // call the current render's callbacks instead of the first render's.
@@ -168,13 +198,22 @@ export function useSpeechInput({
       setListening(false);
       // Chrome stops on its own after silence. Restart only if the user
       // never asked us to stop and we are not muted for playback.
-      if (wantListeningRef.current && !suspendedRef.current) {
+      //
+      // Also the recovery path for `resume`: if the recogniser had not
+      // finished aborting when the assistant stopped speaking, resume's own
+      // start() threw, and this is where the mic comes back. Without it the
+      // microphone stays dead after a reply until it is toggled by hand.
+      if (!wantListeningRef.current || suspendedRef.current) return;
+      if (restartTimerRef.current !== null) clearTimeout(restartTimerRef.current);
+      restartTimerRef.current = setTimeout(() => {
+        restartTimerRef.current = null;
+        if (!wantListeningRef.current || suspendedRef.current) return;
         try {
           recognition.start();
         } catch {
           // Already starting; the next onend will try again.
         }
-      }
+      }, RESTART_DELAY_MS);
     };
 
     recognitionRef.current = recognition;
@@ -195,26 +234,37 @@ export function useSpeechInput({
     }
   }, [ensureRecognition]);
 
+  const clearRestart = useCallback(() => {
+    if (restartTimerRef.current !== null) {
+      clearTimeout(restartTimerRef.current);
+      restartTimerRef.current = null;
+    }
+  }, []);
+
   const stop = useCallback(() => {
     wantListeningRef.current = false;
     suspendedRef.current = false;
+    clearRestart();
     setEnabled(false);
     // Send whatever was said before the mic went off rather than dropping a
     // half-finished sentence on the floor.
     getBuffer().flush();
     setInterim("");
     recognitionRef.current?.stop();
-  }, [getBuffer]);
+  }, [getBuffer, clearRestart]);
 
   const suspend = useCallback(() => {
     if (!wantListeningRef.current) return;
     suspendedRef.current = true;
+    // Cancel any restart already queued, or the mic comes straight back up
+    // in the middle of the reply it was muted for.
+    clearRestart();
     // abort(), not stop(): stop() delivers a final result for whatever the
     // mic caught, and what it caught is the assistant's own voice.
     getBuffer().reset();
     setInterim("");
     recognitionRef.current?.abort();
-  }, [getBuffer]);
+  }, [getBuffer, clearRestart]);
 
   const resume = useCallback(() => {
     if (!wantListeningRef.current || !suspendedRef.current) return;
@@ -229,6 +279,7 @@ export function useSpeechInput({
   useEffect(
     () => () => {
       wantListeningRef.current = false;
+      if (restartTimerRef.current !== null) clearTimeout(restartTimerRef.current);
       bufferRef.current?.reset();
       recognitionRef.current?.abort();
     },

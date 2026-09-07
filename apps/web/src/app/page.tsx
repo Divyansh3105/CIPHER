@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
 import ConversationSidebar from "@/components/ConversationSidebar";
 import MessageList from "@/components/MessageList";
 import ChatInput from "@/components/ChatInput";
@@ -35,6 +35,59 @@ import { DEFAULT_PERSONA, FALLBACK_PERSONAS, type Persona, personaLabel } from "
 interface Notice {
   tone: NoticeTone;
   text: string;
+}
+
+//: Which transcription backend to open the microphone on, remembered across
+//: sessions. Deliberately localStorage and not the database: it is a fact
+//: about this browser on this machine, not about the user, and syncing it to
+//: an account would carry a Brave laptop's answer over to a Chrome desktop
+//: where the browser service works perfectly well.
+const STT_BACKEND_KEY = "cipher.stt-backend";
+
+type SttBackend = "browser" | "whisper";
+
+// Read through useSyncExternalStore rather than an effect, the same way
+// useVoice reads feature detection. localStorage does not exist during SSR,
+// so probing in render would crash on the server, and probing in an effect
+// is a synchronous setState in an effect body -- which React now rejects
+// outright. This says the honest thing instead: the server has no stored
+// preference, the client answers for itself, and the answer only changes
+// when something here changes it.
+let sttBackendCache: SttBackend | null = null;
+const sttBackendListeners = new Set<() => void>();
+
+function readSttBackend(): SttBackend {
+  if (sttBackendCache === null) {
+    try {
+      const saved = window.localStorage.getItem(STT_BACKEND_KEY);
+      sttBackendCache = saved === "whisper" || saved === "browser" ? saved : "browser";
+    } catch {
+      // Storage can throw outright in private windows. The default stands.
+      sttBackendCache = "browser";
+    }
+  }
+  return sttBackendCache;
+}
+
+function serverSttBackend(): SttBackend {
+  return "browser";
+}
+
+function subscribeSttBackend(listener: () => void) {
+  sttBackendListeners.add(listener);
+  return () => {
+    sttBackendListeners.delete(listener);
+  };
+}
+
+function setSttBackend(backend: SttBackend) {
+  sttBackendCache = backend;
+  try {
+    window.localStorage.setItem(STT_BACKEND_KEY, backend);
+  } catch {
+    // Private windows can throw on write. Not remembering is survivable.
+  }
+  for (const listener of sttBackendListeners) listener();
 }
 
 export default function Home() {
@@ -92,15 +145,16 @@ export default function Home() {
   // is instant and free; the recorder path costs a round trip per utterance
   // but works in browsers where the browser's own service does not exist or
   // cannot be reached -- which is most of them outside Google Chrome.
-  const [sttBackend, setSttBackend] = useState<"browser" | "whisper">("browser");
-  // Set when the browser backend failed mid-attempt, so the replacement can
-  // pick up where it left off. The user clicked the microphone once; making
-  // them click again after a failure they did not cause is friction with no
-  // purpose.
+  const sttBackend = useSyncExternalStore(subscribeSttBackend, readSttBackend, serverSttBackend);
+  // Set when the mic was on across a backend change -- either the browser
+  // service failing mid-attempt, or a deliberate switch -- so the
+  // replacement picks up where it left off. The user clicked the microphone
+  // once; making them click again after a change they did not cause, or one
+  // they made in a different control, is friction with no purpose.
   //
   // A ref, not state: nothing renders from it, and clearing it inside the
-  // effect below would be a synchronous setState in an effect body.
-  const resumeOnFallbackRef = useRef(false);
+  // effects below would be a synchronous setState in an effect body.
+  const resumeAfterSwitchRef = useRef(false);
 
   // Hands-free: ignore everything until addressed by name. Opt-in per
   // session and never persisted -- see WAKE_WORD in @/lib/speech for why
@@ -277,7 +331,7 @@ export default function Home() {
     // backend that works.
     onFatal: () => {
       setSttBackend("whisper");
-      resumeOnFallbackRef.current = true;
+      resumeAfterSwitchRef.current = true;
       setNotice({
         tone: "amber",
         text: "This browser's speech service is unavailable, so speech is now being transcribed on the server instead.",
@@ -297,10 +351,17 @@ export default function Home() {
   // moment onFatal runs, `mic` is still the backend that just failed, and
   // starting it again would fail again.
   useEffect(() => {
-    if (sttBackend !== "whisper" || !resumeOnFallbackRef.current) return;
-    resumeOnFallbackRef.current = false;
+    if (sttBackend !== "whisper" || !resumeAfterSwitchRef.current) return;
+    resumeAfterSwitchRef.current = false;
     whisperMic.start();
   }, [sttBackend, whisperMic]);
+
+  // The same, in the other direction, for a deliberate switch back.
+  useEffect(() => {
+    if (sttBackend !== "browser" || !resumeAfterSwitchRef.current) return;
+    resumeAfterSwitchRef.current = false;
+    browserMic.start();
+  }, [sttBackend, browserMic]);
 
   useEffect(() => {
     suspendMicRef.current = mic.suspend;
@@ -511,6 +572,23 @@ export default function Home() {
     setHandsFree((on) => !on);
   }
 
+  function handleToggleSttBackend() {
+    const next = sttBackend === "whisper" ? "browser" : "whisper";
+    // Carry the mic across the switch. Making someone click the microphone
+    // again after changing a setting is friction with no purpose -- the same
+    // reasoning as the automatic fallback below.
+    resumeAfterSwitchRef.current = mic.enabled;
+    if (mic.enabled) mic.stop();
+    setSttBackend(next);
+    setNotice({
+      tone: "zinc",
+      text:
+        next === "whisper"
+          ? "Speech is now transcribed on the server. This is the reliable path outside Google Chrome."
+          : "Speech is now transcribed by this browser's own speech service. It is instant, and it does not work in every browser.",
+    });
+  }
+
   function handleToggleMic() {
     setDroppedUtterance(false);
     if (mic.enabled) {
@@ -660,6 +738,13 @@ export default function Home() {
             outputSupported={speech.supported}
             onToggleVoiceReplies={handleToggleVoiceReplies}
             onStopSpeaking={speech.cancel}
+            level={mic.level}
+            noiseFloor={mic.noiseFloor}
+            devices={mic.devices}
+            deviceId={mic.deviceId}
+            onSelectDevice={(id) => mic.setDeviceId?.(id)}
+            sttBackend={sttBackend}
+            onToggleSttBackend={handleToggleSttBackend}
           />
           <ChatInput
             disabled={pending}

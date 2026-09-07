@@ -61,6 +61,45 @@ const TEXT_CLASS: Record<VoiceState, string> = {
   speaking: "text-zinc-100",
 };
 
+/**
+ * The input-level meter.
+ *
+ * The single most useful thing on this bar when something is wrong, and it
+ * was the thing missing when "the mic hears nothing" and "the mic is sending
+ * things I never said" looked identical from the outside. A bar that moves
+ * when you speak separates a dead input device from a transcription problem
+ * in about one second, without opening a console.
+ *
+ * Rendered only for the server-transcription path: the browser recogniser
+ * hands back words and no audio at all, so there is nothing to measure and
+ * drawing a bar anyway would be a decoration pretending to be an instrument.
+ */
+function LevelMeter({ level, noiseFloor }: { level: number; noiseFloor: number | null }) {
+  const bars = 5;
+  const lit = Math.round(level * bars);
+  return (
+    <span
+      className="flex h-3.5 items-end gap-0.5 border-l border-zinc-800 pl-2.5"
+      title={
+        noiseFloor === null
+          ? "Measuring this microphone's noise floor…"
+          : `Input level. Noise floor measured at ${noiseFloor.toFixed(4)} RMS; speech has to exceed about ${(noiseFloor * 3).toFixed(4)} to be captured.`
+      }
+      aria-hidden
+    >
+      {Array.from({ length: bars }, (_, i) => (
+        <span
+          key={i}
+          className={`w-1 rounded-full transition-colors ${
+            i < lit ? "bg-emerald-500" : "bg-zinc-800"
+          }`}
+          style={{ height: `${5 + i * 2.2}px` }}
+        />
+      ))}
+    </span>
+  );
+}
+
 export default function VoiceControls({
   state,
   micOn,
@@ -74,6 +113,13 @@ export default function VoiceControls({
   outputSupported,
   onToggleVoiceReplies,
   onStopSpeaking,
+  level,
+  noiseFloor,
+  devices,
+  deviceId,
+  onSelectDevice,
+  sttBackend,
+  onToggleSttBackend,
 }: {
   state: VoiceState;
   /**
@@ -95,6 +141,25 @@ export default function VoiceControls({
   outputSupported: boolean;
   onToggleVoiceReplies: () => void;
   onStopSpeaking: () => void;
+
+  /** Undefined on the browser recogniser, which exposes no audio. */
+  level?: number;
+  noiseFloor?: number | null;
+  devices?: { id: string; label: string }[];
+  deviceId?: string | null;
+  onSelectDevice?: (id: string) => void;
+  /**
+   * Which transcription backend is running, and a way to change it by hand.
+   *
+   * Previously the server path was reachable only by the browser recogniser
+   * failing outright with `error: "network"`. That covers the browsers where
+   * it does not work at all, and none of the ones where it works badly --
+   * dropping words, stopping after a minute, mishearing a name every time.
+   * There was no way out of a backend that was merely bad, which is a worse
+   * trap than one that is plainly broken.
+   */
+  sttBackend: "browser" | "whisper";
+  onToggleSttBackend: () => void;
 }) {
   function statusText(): string {
     if (state === "unsupported") {
@@ -160,6 +225,10 @@ export default function VoiceControls({
             {statusText()}
           </p>
 
+          {micOn && level !== undefined && state !== "speaking" && (
+            <LevelMeter level={level} noiseFloor={noiseFloor ?? null} />
+          )}
+
           {state === "speaking" && (
             <span className="flex h-3.5 items-center gap-1 border-l border-zinc-800 pl-2.5" aria-hidden>
               <span className="h-2 w-1 animate-pulse rounded-full bg-indigo-400/70" />
@@ -172,6 +241,35 @@ export default function VoiceControls({
         </div>
 
         <div className="flex shrink-0 items-center gap-2 font-mono text-[11px]">
+          {micOn && devices !== undefined && devices.length > 1 && (
+            <select
+              value={deviceId ?? ""}
+              onChange={(event) => onSelectDevice?.(event.target.value)}
+              aria-label="Microphone input device"
+              title="Which microphone to listen on"
+              className="max-w-[9rem] truncate rounded border border-zinc-800 bg-zinc-900 px-1.5 py-0.5 text-zinc-400 transition-colors hover:text-zinc-200 focus:border-zinc-600 focus:outline-none"
+            >
+              {devices.map((device) => (
+                <option key={device.id} value={device.id}>
+                  {device.label}
+                </option>
+              ))}
+            </select>
+          )}
+
+          <button
+            type="button"
+            onClick={onToggleSttBackend}
+            title={
+              sttBackend === "whisper"
+                ? "Transcribing on the server (Whisper). Click to try this browser's own speech service."
+                : "Using this browser's speech service. Click to transcribe on the server instead — more reliable outside Google Chrome."
+            }
+            className="rounded border border-zinc-800 bg-zinc-900 px-2 py-0.5 text-zinc-500 transition-colors hover:text-zinc-300"
+          >
+            {sttBackend === "whisper" ? "Server STT" : "Browser STT"}
+          </button>
+
           {state === "speaking" && (
             <button
               type="button"

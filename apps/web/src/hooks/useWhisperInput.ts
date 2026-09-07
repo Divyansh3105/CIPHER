@@ -1,45 +1,171 @@
 "use client";
 
-// Speech input that works in any browser (Phase 4, revisited).
+// Speech input that works in any browser (Phase 4, revisited twice).
 //
 // `webkitSpeechRecognition` was Phase 4's only input, and it has a failure
 // mode that reads as a network fault and is not: outside Google Chrome the
 // API frequently exists and always fails with `error: "network"`, because
 // Chromium forks ship the interface without Google's speech backend
-// credentials. Firefox and Safari do not implement it at all.
+// credentials. Firefox and Safari do not implement it at all. So this path
+// is not a fallback for most people -- it is the microphone.
 //
-// This records with MediaRecorder and posts each utterance to
-// /voice/transcribe, which uses Groq's hosted Whisper. Same `SpeechInput`
-// interface as useSpeechInput, so the page does not know or care which one
-// is running.
+// The first version of it recorded fixed segments with MediaRecorder and
+// decided an utterance was over whenever 400ms of audio had accumulated and
+// 900ms of it was quiet. An idle microphone meets that condition every 1.3
+// seconds, forever, which is where all four reported symptoms came from at
+// once -- silence uploaded on a loop, the 20/min rate limit gone in about
+// 26 seconds, Whisper's filler ("Thank you.", "you") arriving as real chat
+// messages, and the first syllable after each pause lost in the gap between
+// one recorder stopping and the next starting.
 //
-// The hard part is where an utterance ends. The Web Speech API decides that
-// itself; here it has to be detected, and the same rule from `FINISH_MS`
-// applies: people pause mid-sentence, so a cut on the first quiet moment
-// truncates roughly every other utterance. Silence is measured from the
-// audio itself and has to persist for the whole finish window before the
-// clip is closed and sent.
+// It now captures raw samples continuously and asks @/lib/audio whether
+// anyone is talking. Audio is only ever uploaded when speech was heard, the
+// threshold is measured against this microphone in this room rather than
+// hardcoded, and a rolling pre-roll means the run-up to a word is already
+// buffered by the time the word is recognised as one.
+//
+// Same `SpeechInput` interface as useSpeechInput, so the page does not know
+// or care which one is running.
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { FINISH_MS, isInterrupt } from "@/lib/speech";
-import { transcribe } from "@/lib/api";
+import { createUtteranceDetector, encodeWav, type UtteranceDetector } from "@/lib/audio";
+import { transcribe, ApiError } from "@/lib/api";
 import type { SpeechInput } from "@/hooks/useVoice";
 
-//: RMS below this counts as silence. Measured against real microphone input
-//: rather than guessed: an open mic in a quiet room idles around 0.005-0.01,
-//: and speech sits an order of magnitude above it. Too low and background
-//: hum reads as talking, so the clip never closes.
-const SILENCE_RMS = 0.018;
+//: Whisper's own working rate. Asking the AudioContext for it means no
+//: resampling anywhere -- not in the browser, not on the server -- and makes
+//: the upload about a third the size of the 48 kHz default for audio the
+//: model cannot use the extra bandwidth of anyway.
+const TARGET_SAMPLE_RATE = 16000;
 
-//: Ignore silence until this much audio exists. Without it the recorder
-//: closes immediately, because the moment it opens there is nothing but
-//: silence.
-const MIN_UTTERANCE_MS = 400;
+//: Frames per callback in the ScriptProcessor fallback. 4096 at 16 kHz is
+//: 256ms, which is coarse enough to be cheap and fine enough that the VAD
+//: still reacts within one frame.
+const FALLBACK_BUFFER_SIZE = 4096;
 
-//: A hard ceiling, so a noisy room cannot record forever.
-const MAX_UTTERANCE_MS = 25000;
+//: How many consecutive upload failures before the mic gives up and says so.
+//: One failure is a blip and must not interrupt a conversation; a run of
+//: them means the backend is down or the key is rejected, and silently
+//: swallowing that is how the old version looked like a broken microphone.
+const MAX_CONSECUTIVE_FAILURES = 3;
 
-const ANALYSER_INTERVAL_MS = 100;
+/**
+ * The worklet is four lines and lives here as a string on purpose.
+ *
+ * An AudioWorklet module has to be fetched by URL, which normally means a
+ * file in `public/` -- a served asset, a path to keep in sync, and one more
+ * thing that can 404 in a deployment. A blob URL keeps it next to the code
+ * that uses it. `slice(0)` is not optional: the buffer handed to `process`
+ * is reused on the next call, so posting it without copying delivers audio
+ * that has already been overwritten.
+ */
+const CAPTURE_WORKLET = `
+class CipherCaptureProcessor extends AudioWorkletProcessor {
+  process(inputs) {
+    const channel = inputs[0] && inputs[0][0];
+    if (channel && channel.length) this.port.postMessage(channel.slice(0));
+    return true;
+  }
+}
+registerProcessor('cipher-capture', CipherCaptureProcessor);
+`;
+
+interface Capture {
+  context: AudioContext;
+  stream: MediaStream;
+  disconnect: () => void;
+}
+
+/**
+ * Open the microphone and deliver frames of mono samples.
+ *
+ * Prefers an AudioWorklet, which runs on the audio thread and cannot be
+ * starved by React rendering. Falls back to ScriptProcessorNode -- deprecated
+ * but implemented everywhere, and this path is specifically for the browsers
+ * that do not implement things.
+ */
+async function openCapture(
+  deviceId: string | null,
+  onFrame: (frame: Float32Array) => void
+): Promise<Capture> {
+  const stream = await navigator.mediaDevices.getUserMedia({
+    audio: {
+      // Stated rather than left to the browser's defaults. Echo cancellation
+      // is what stops the assistant's own replies being transcribed back as
+      // user speech through the laptop speakers; the mic is muted while it
+      // talks as well, but the two failures overlap and only one of them is
+      // under this hook's control.
+      echoCancellation: true,
+      noiseSuppression: true,
+      autoGainControl: true,
+      channelCount: 1,
+      ...(deviceId ? { deviceId: { exact: deviceId } } : {}),
+    },
+  });
+
+  // A requested rate the hardware cannot honour throws rather than being
+  // approximated, so the default-rate context is the fallback. Either way
+  // the real rate is read back off the context and travels with the WAV.
+  let context: AudioContext;
+  try {
+    context = new AudioContext({ sampleRate: TARGET_SAMPLE_RATE });
+  } catch {
+    context = new AudioContext();
+  }
+  // Chrome starts contexts suspended until a gesture; turning the mic on is
+  // one, but the resume has to be asked for explicitly.
+  if (context.state === "suspended") await context.resume().catch(() => {});
+
+  const source = context.createMediaStreamSource(stream);
+  // Every capture node still has to be connected to the destination for the
+  // graph to pull audio through it. At zero gain that costs nothing and,
+  // crucially, does not play the microphone back through the speakers.
+  const sink = context.createGain();
+  sink.gain.value = 0;
+  sink.connect(context.destination);
+
+  let workletUrl: string | null = null;
+  try {
+    workletUrl = URL.createObjectURL(new Blob([CAPTURE_WORKLET], { type: "text/javascript" }));
+    await context.audioWorklet.addModule(workletUrl);
+    const node = new AudioWorkletNode(context, "cipher-capture");
+    node.port.onmessage = (event) => onFrame(event.data as Float32Array);
+    source.connect(node);
+    node.connect(sink);
+    return {
+      context,
+      stream,
+      disconnect: () => {
+        node.port.onmessage = null;
+        node.disconnect();
+        source.disconnect();
+        sink.disconnect();
+        if (workletUrl) URL.revokeObjectURL(workletUrl);
+      },
+    };
+  } catch {
+    if (workletUrl) URL.revokeObjectURL(workletUrl);
+    const node = context.createScriptProcessor(FALLBACK_BUFFER_SIZE, 1, 1);
+    node.onaudioprocess = (event) => {
+      // Copied for the same reason the worklet copies: this buffer is the
+      // node's, and it is reused.
+      onFrame(new Float32Array(event.inputBuffer.getChannelData(0)));
+    };
+    source.connect(node);
+    node.connect(sink);
+    return {
+      context,
+      stream,
+      disconnect: () => {
+        node.onaudioprocess = null;
+        node.disconnect();
+        source.disconnect();
+        sink.disconnect();
+      },
+    };
+  }
+}
 
 export function useWhisperInput({
   onUtterance,
@@ -52,22 +178,25 @@ export function useWhisperInput({
   const [listening, setListening] = useState(false);
   const [interim, setInterim] = useState("");
   const [error, setError] = useState<string | null>(null);
+  const [level, setLevel] = useState(0);
+  // Surfaced for the diagnostics readout. Held in state rather than read off
+  // the detector during render, because reading a ref while rendering is
+  // exactly what react-hooks/refs forbids.
+  const [noiseFloor, setNoiseFloor] = useState<number | null>(null);
+  const [devices, setDevices] = useState<{ id: string; label: string }[]>([]);
+  const [deviceId, setDeviceIdState] = useState<string | null>(null);
 
-  const streamRef = useRef<MediaStream | null>(null);
-  const recorderRef = useRef<MediaRecorder | null>(null);
-  const audioContextRef = useRef<AudioContext | null>(null);
-  const analyserRef = useRef<AnalyserNode | null>(null);
-  const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  const chunksRef = useRef<Blob[]>([]);
-  const silenceMsRef = useRef(0);
-  const utteranceMsRef = useRef(0);
-  // startSegment reopens the recorder from inside its own onstop handler.
-  // Calling it directly would close over the binding as it was when the
-  // handler was created; going through a ref always reaches the current one,
-  // and satisfies the rule against using a value before it is declared.
-  const startSegmentRef = useRef<() => void>(() => {});
+  const captureRef = useRef<Capture | null>(null);
+  const detectorRef = useRef<UtteranceDetector | null>(null);
+  const meterRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const suspendedRef = useRef(false);
   const wantListeningRef = useRef(false);
+  const failuresRef = useRef(0);
+  //: Set when the server says 429. Until it passes, utterances are dropped
+  //: locally rather than sent -- retrying into a rate limit is what turns a
+  //: brief overage into a lockout.
+  const cooldownUntilRef = useRef(0);
+  const deviceIdRef = useRef<string | null>(null);
 
   const onUtteranceRef = useRef(onUtterance);
   const onInterruptRef = useRef(onInterrupt);
@@ -80,31 +209,14 @@ export function useWhisperInput({
     typeof window !== "undefined" &&
     typeof navigator !== "undefined" &&
     typeof navigator.mediaDevices?.getUserMedia === "function" &&
-    typeof window.MediaRecorder !== "undefined";
+    typeof window.AudioContext !== "undefined";
 
-  const teardown = useCallback(() => {
-    if (timerRef.current !== null) {
-      clearInterval(timerRef.current);
-      timerRef.current = null;
-    }
-    if (recorderRef.current && recorderRef.current.state !== "inactive") {
-      // onstop still fires; chunksRef is cleared so it sends nothing.
-      chunksRef.current = [];
-      recorderRef.current.stop();
-    }
-    recorderRef.current = null;
-    streamRef.current?.getTracks().forEach((track) => track.stop());
-    streamRef.current = null;
-    void audioContextRef.current?.close().catch(() => {});
-    audioContextRef.current = null;
-    analyserRef.current = null;
-    setListening(false);
-    setInterim("");
-  }, []);
-
-  const send = useCallback(async (blob: Blob) => {
+  const send = useCallback(async (samples: Float32Array, sampleRate: number) => {
+    if (Date.now() < cooldownUntilRef.current) return;
     try {
-      const text = await transcribe(blob);
+      const text = await transcribe(encodeWav(samples, sampleRate));
+      failuresRef.current = 0;
+      setError(null);
       const trimmed = text.trim();
       if (!trimmed) return;
       // Interrupt words are controls, not messages -- same rule as the
@@ -114,127 +226,167 @@ export function useWhisperInput({
         return;
       }
       onUtteranceRef.current(trimmed);
-    } catch {
-      // A failed transcription must not stop the microphone: the next
-      // utterance is likely to work, and silently dropping one clip is far
-      // better than the mic switching itself off mid-conversation.
-      setError("That last bit could not be transcribed. Still listening.");
+    } catch (err) {
+      failuresRef.current += 1;
+
+      if (err instanceof ApiError && err.status === 429) {
+        // Should now be unreachable -- silence is no longer uploaded, and a
+        // person cannot speak thirty separate utterances in a minute -- but
+        // if it happens the honest thing is to say the limit was hit rather
+        // than blame the audio, which is what the old message did.
+        cooldownUntilRef.current = Date.now() + 20000;
+        setError("Transcription rate limit reached. Pausing for a moment, then listening again.");
+        return;
+      }
+
+      // One failure is a blip; a conversation must not stop for it, and the
+      // next utterance is very likely to work.
+      if (failuresRef.current < MAX_CONSECUTIVE_FAILURES) {
+        setError("That last bit could not be transcribed. Still listening.");
+        return;
+      }
+
+      setError(
+        err instanceof ApiError && err.status === 0
+          ? "The backend is unreachable, so nothing can be transcribed. Check that it is running."
+          : "Transcription keeps failing. Check the backend logs and GROQ_API_KEY."
+      );
     }
   }, []);
 
-  const startSegment = useCallback(() => {
-    const stream = streamRef.current;
-    if (!stream || suspendedRef.current) return;
-
-    const recorder = new MediaRecorder(stream);
-    chunksRef.current = [];
-    silenceMsRef.current = 0;
-    utteranceMsRef.current = 0;
-
-    recorder.ondataavailable = (event) => {
-      if (event.data.size > 0) chunksRef.current.push(event.data);
-    };
-    recorder.onstop = () => {
-      const chunks = chunksRef.current;
-      chunksRef.current = [];
-      if (chunks.length > 0) {
-        void send(new Blob(chunks, { type: recorder.mimeType || "audio/webm" }));
-      }
-      // Immediately open the next segment, so speech during transcription is
-      // still captured rather than falling into a gap.
-      if (wantListeningRef.current && !suspendedRef.current) startSegmentRef.current();
-    };
-
-    recorder.start();
-    recorderRef.current = recorder;
-    setListening(true);
-  }, [send]);
-
-  useEffect(() => {
-    startSegmentRef.current = startSegment;
-  }, [startSegment]);
+  const teardown = useCallback(() => {
+    if (meterRef.current !== null) {
+      clearInterval(meterRef.current);
+      meterRef.current = null;
+    }
+    captureRef.current?.disconnect();
+    captureRef.current?.stream.getTracks().forEach((track) => track.stop());
+    void captureRef.current?.context.close().catch(() => {});
+    captureRef.current = null;
+    detectorRef.current = null;
+    setListening(false);
+    setInterim("");
+    setLevel(0);
+    setNoiseFloor(null);
+  }, []);
 
   const start = useCallback(async () => {
     if (!supported) {
-      setError("This browser cannot record audio.");
+      setError("This browser cannot capture audio.");
       return;
     }
+    if (captureRef.current) return;
+
     setError(null);
+    failuresRef.current = 0;
+    cooldownUntilRef.current = 0;
     wantListeningRef.current = true;
     suspendedRef.current = false;
 
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      streamRef.current = stream;
+      const capture = await openCapture(deviceIdRef.current, (frame) => {
+        // Muted while the assistant is talking. Dropped at the very front so
+        // the detector never sees the assistant's own voice and cannot
+        // mistake it for a turn.
+        if (suspendedRef.current) return;
+        detectorRef.current?.push(frame);
+      });
+      captureRef.current = capture;
+
+      detectorRef.current = createUtteranceDetector({
+        sampleRate: capture.context.sampleRate,
+        finishMs: FINISH_MS,
+        onUtterance: (samples, sampleRate) => void send(samples, sampleRate),
+      });
+
       setEnabled(true);
+      setListening(true);
 
-      const context = new AudioContext();
-      const analyser = context.createAnalyser();
-      analyser.fftSize = 2048;
-      context.createMediaStreamSource(stream).connect(analyser);
-      audioContextRef.current = context;
-      analyserRef.current = analyser;
+      // The meter is polled rather than pushed: frames arrive every few
+      // milliseconds and setting React state on each one would re-render the
+      // page a hundred times a second to move a bar a pixel.
+      meterRef.current = setInterval(() => {
+        const detector = detectorRef.current;
+        if (!detector) return;
+        setLevel(suspendedRef.current ? 0 : detector.level());
+        setInterim(detector.speaking() ? "…" : "");
+        setNoiseFloor(detector.ready() ? detector.noiseFloor() : null);
+      }, 100);
 
-      const samples = new Float32Array(analyser.fftSize);
-      timerRef.current = setInterval(() => {
-        const node = analyserRef.current;
-        const recorder = recorderRef.current;
-        if (!node || !recorder || recorder.state !== "recording") return;
-
-        node.getFloatTimeDomainData(samples);
-        let sum = 0;
-        for (const sample of samples) sum += sample * sample;
-        const rms = Math.sqrt(sum / samples.length);
-
-        utteranceMsRef.current += ANALYSER_INTERVAL_MS;
-        silenceMsRef.current = rms < SILENCE_RMS ? silenceMsRef.current + ANALYSER_INTERVAL_MS : 0;
-        setInterim(rms < SILENCE_RMS ? "" : "…");
-
-        const longEnough = utteranceMsRef.current >= MIN_UTTERANCE_MS;
-        const finished = silenceMsRef.current >= FINISH_MS;
-        const tooLong = utteranceMsRef.current >= MAX_UTTERANCE_MS;
-
-        // The same rule as the browser path: a pause only ends the thought
-        // once it has lasted the whole finish window.
-        if ((longEnough && finished) || tooLong) recorder.stop();
-      }, ANALYSER_INTERVAL_MS);
-
-      startSegment();
-    } catch {
+      // Labels are empty until permission is granted, so this is enumerated
+      // after getUserMedia rather than before it. Without that the picker
+      // reads "Microphone 1 / Microphone 2" and helps nobody choose.
+      void navigator.mediaDevices
+        .enumerateDevices()
+        .then((all) => {
+          setDevices(
+            all
+              .filter((device) => device.kind === "audioinput")
+              .map((device, index) => ({
+                id: device.deviceId,
+                label: device.label || `Microphone ${index + 1}`,
+              }))
+          );
+          const active = capture.stream.getAudioTracks()[0]?.getSettings().deviceId;
+          if (active) setDeviceIdState((current) => current ?? active);
+        })
+        .catch(() => {
+          // Non-fatal: the picker just stays empty and the default mic is used.
+        });
+    } catch (err) {
       wantListeningRef.current = false;
       setEnabled(false);
-      setError("Microphone access was blocked. Allow it in the browser's site settings, then try again.");
+      setError(
+        err instanceof DOMException && err.name === "NotFoundError"
+          ? "No microphone was found. Check that one is connected and selected as the input device."
+          : "Microphone access was blocked. Allow it in the browser's site settings, then try again."
+      );
     }
-  }, [supported, startSegment]);
+  }, [supported, send]);
 
   const stop = useCallback(() => {
     wantListeningRef.current = false;
     suspendedRef.current = false;
     setEnabled(false);
-    // Unlike teardown's discard, a deliberate stop sends what was captured
-    // rather than dropping a half-finished sentence.
-    const recorder = recorderRef.current;
-    if (recorder && recorder.state === "recording") recorder.stop();
+    // A deliberate stop sends what was captured rather than dropping a
+    // half-finished sentence on the floor.
+    detectorRef.current?.flush();
     teardown();
   }, [teardown]);
 
   const suspend = useCallback(() => {
     if (!wantListeningRef.current) return;
     suspendedRef.current = true;
-    // Discard rather than send: what the mic caught while the assistant was
-    // talking is the assistant.
-    chunksRef.current = [];
-    const recorder = recorderRef.current;
-    if (recorder && recorder.state === "recording") recorder.stop();
+    // Discard rather than emit: what the mic caught while the assistant was
+    // talking is the assistant. The capture graph stays open -- tearing the
+    // microphone down and back up between every reply is what made the old
+    // path lose the first word of the answer to a follow-up question.
+    detectorRef.current?.reset();
     setListening(false);
     setInterim("");
+    setLevel(0);
   }, []);
 
   const resume = useCallback(() => {
     if (!wantListeningRef.current || !suspendedRef.current) return;
     suspendedRef.current = false;
-    startSegment();
-  }, [startSegment]);
+    detectorRef.current?.reset();
+    setListening(true);
+  }, []);
+
+  const setDeviceId = useCallback(
+    (id: string | null) => {
+      deviceIdRef.current = id;
+      setDeviceIdState(id);
+      // Switching input means a new stream, a new context and a new noise
+      // floor. Only restart if the mic was actually on; otherwise the choice
+      // simply applies the next time it is switched on.
+      if (!wantListeningRef.current) return;
+      teardown();
+      void start();
+    },
+    [teardown, start]
+  );
 
   useEffect(() => () => teardown(), [teardown]);
 
@@ -244,6 +396,11 @@ export function useWhisperInput({
     listening,
     interim,
     error,
+    level,
+    devices,
+    deviceId,
+    setDeviceId,
+    noiseFloor,
     start: () => void start(),
     stop,
     suspend,
