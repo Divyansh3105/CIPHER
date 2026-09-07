@@ -1,39 +1,74 @@
 @import "tailwindcss";
 
+/* Phase 8 redesign. The design is dark-only by construction -- every screen
+   was drawn against zinc-950 and the semantic colours (persona accents,
+   amber/red notice strips, tier badges) were picked for contrast on it. A
+   light palette would be a different design, not a variant of this one, so
+   the app commits to dark rather than shipping a half-derived light theme.
+   `color-scheme` below makes native controls (selects, scrollbars, range
+   inputs) follow, which is the part that gives it away otherwise. */
+
+@theme {
+  --font-sans: var(--font-inter), -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  --font-mono: var(--font-jetbrains-mono), ui-monospace, SFMono-Regular, monospace;
+
+  /* Extra zinc steps the design leans on. 850 is the hover/selected surface,
+     925 the chrome (rails, headers, composer), 950 the page ground -- Tailwind's
+     own 950 (#09090b) is a shade too black against them. */
+  --color-zinc-750: #35353b;
+  --color-zinc-850: #1f1f23;
+  --color-zinc-925: #111114;
+  --color-zinc-950: #0c0c0e;
+
+  /* Persona accents. Used ONLY on a message's persona label, the sidebar's
+     persona sublabel/dot, and the persona switcher. If these spread into the
+     chrome, the reply's voice stops being identifiable at a glance -- which is
+     the entire job they do. */
+  --color-persona-jarvis: #6366f1;
+  --color-persona-friday: #f59e0b;
+  --color-persona-ultron: #ef4444;
+}
+
 :root {
-  --background: #ffffff;
-  --foreground: #171717;
-
-  /* Persona accent colors -- used only for the message-bubble label and the
-     sidebar's persona sublabel, never for the zinc-based chrome. */
-  --persona-jarvis: #4f46e5;
-  --persona-friday: #d97706;
-  --persona-ultron: #dc2626;
+  color-scheme: dark;
 }
 
-@theme inline {
-  --color-background: var(--background);
-  --color-foreground: var(--foreground);
-  --color-persona-jarvis: var(--persona-jarvis);
-  --color-persona-friday: var(--persona-friday);
-  --color-persona-ultron: var(--persona-ultron);
-  --font-sans: var(--font-geist-sans);
-  --font-mono: var(--font-geist-mono);
-}
-
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
-
-    --persona-jarvis: #818cf8;
-    --persona-friday: #fbbf24;
-    --persona-ultron: #f87171;
-  }
+html,
+body {
+  height: 100%;
 }
 
 body {
-  background: var(--background);
-  color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+  background: var(--color-zinc-950);
+  color: var(--color-zinc-300);
+}
+
+/* Thin technical scrollbars. WebKit only by design: Firefox's
+   `scrollbar-width: thin` is close enough and set alongside. */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: #27272a transparent;
+}
+
+::-webkit-scrollbar {
+  width: 5px;
+  height: 5px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #27272a;
+  border-radius: 2px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #3f3f46;
+}
+
+::selection {
+  background: #27272a;
+  color: #f4f4f5;
 }

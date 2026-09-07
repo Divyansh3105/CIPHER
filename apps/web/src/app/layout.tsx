@@ -1,14 +1,15 @@
 import type { Metadata } from "next";
-import { Geist, Geist_Mono } from "next/font/google";
+import { Inter, JetBrains_Mono } from "next/font/google";
+import NavRail from "@/components/NavRail";
 import "./globals.css";
 
-const geistSans = Geist({
-  variable: "--font-geist-sans",
+const inter = Inter({
+  variable: "--font-inter",
   subsets: ["latin"],
 });
 
-const geistMono = Geist_Mono({
-  variable: "--font-geist-mono",
+const jetbrainsMono = JetBrains_Mono({
+  variable: "--font-jetbrains-mono",
   subsets: ["latin"],
 });
 
@@ -21,9 +22,17 @@ export default function RootLayout({ children }: LayoutProps<"/">) {
   return (
     <html
       lang="en"
-      className={`${geistSans.variable} ${geistMono.variable} h-full antialiased`}
+      className={`${inter.variable} ${jetbrainsMono.variable} h-full antialiased`}
     >
-      <body className="min-h-full flex flex-col">{children}</body>
+      {/* `overflow-hidden` is what makes the shell a desktop app rather than a
+          document: every screen scrolls its own panes, and the page itself
+          never does. */}
+      <body className="h-full overflow-hidden bg-zinc-950 font-sans text-zinc-200">
+        <div className="flex h-full w-full overflow-hidden">
+          <NavRail />
+          <div className="flex min-w-0 flex-1 flex-col overflow-hidden">{children}</div>
+        </div>
+      </body>
     </html>
   );
 }

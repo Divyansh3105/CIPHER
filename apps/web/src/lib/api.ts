@@ -131,6 +131,18 @@ export function getConversation(id: string): Promise<ConversationDetail> {
   return request<ConversationDetail>(`/chat/conversations/${id}`);
 }
 
+// Returns counts rather than void, and the counts are worth surfacing: the
+// backend detaches agent runs instead of letting them cascade away, so
+// "deleted 1, kept 3 runs" is a different outcome from "deleted 1".
+export function deleteConversation(
+  id: string
+): Promise<{ deleted: number; messages_removed: number; agent_runs_detached: number }> {
+  return request<{ deleted: number; messages_removed: number; agent_runs_detached: number }>(
+    `/chat/conversations/${id}`,
+    { method: "DELETE" }
+  );
+}
+
 export function listPersonas(): Promise<PersonaInfo[]> {
   return request<PersonaInfo[]>("/personas");
 }
@@ -306,6 +318,17 @@ export interface DocumentUploadResult {
   deduplicated: boolean;
 }
 
+export interface DocumentChunk {
+  id: string;
+  chunk_index: number;
+  page_number: number | null;
+  content: string;
+  // False when the passage was stored but never embedded -- it is in the
+  // document and can never be retrieved. Shown rather than implied: a panel
+  // that lists it as an ordinary passage lies about what CIPHER can quote.
+  embedded: boolean;
+}
+
 export interface ToolInfo {
   name: string;
   description: string;
@@ -323,6 +346,14 @@ export function deleteDocument(id: string): Promise<{ deleted: number; chunks_re
   return request<{ deleted: number; chunks_removed: number }>(`/documents/${id}`, {
     method: "DELETE",
   });
+}
+
+// The passages a document was split into, in document order. This is what
+// makes a citation checkable: "handbook.pdf, page 4" points at a passage you
+// can actually read here, and page numbers are true because chunks never
+// span pages.
+export function listDocumentChunks(id: string): Promise<DocumentChunk[]> {
+  return request<DocumentChunk[]>(`/documents/${id}/chunks`);
 }
 
 export function listTools(): Promise<ToolInfo[]> {

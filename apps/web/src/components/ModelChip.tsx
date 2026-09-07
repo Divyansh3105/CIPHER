@@ -6,9 +6,12 @@
 // to Qwen", you get an answer, and nothing on screen tells you whether the
 // swap happened -- which is how you end up comparing two models that were
 // the same model. Pinned state is styled differently from default routing
-// on purpose: they behave differently (a pinned model never falls back).
+// on purpose: they behave differently (a pinned model never falls back), and
+// the pinned chip carries its own unpin control so getting back to Auto is
+// one click rather than a trip through the menu.
 
 import { useEffect, useRef, useState } from "react";
+import Icon from "@/components/Icon";
 import type { ActiveModel, ModelInfo } from "@/lib/api";
 
 export default function ModelChip({
@@ -45,35 +48,55 @@ export default function ModelChip({
 
   if (!active) return null;
 
-  const label = active.pinned ? active.display_name : "Auto";
-
   return (
     <div className="relative" ref={containerRef}>
-      <button
-        type="button"
-        onClick={() => setOpen((o) => !o)}
-        disabled={busy}
-        aria-haspopup="listbox"
-        aria-expanded={open}
-        title={
-          active.pinned
-            ? `Pinned to ${active.display_name}. It will not fall back to another model.`
-            : `Default routing: ${active.default_id}, falling back automatically if it fails.`
-        }
+      {/* The unpin control sits beside the menu trigger rather than inside
+          it: a button inside a button is invalid, and clicking "unpin" must
+          not also open the list you were trying to leave. */}
+      <div
         className={[
-          "rounded-full border px-2.5 py-1 text-[11px] font-medium transition disabled:opacity-40",
-          active.pinned
-            ? "border-sky-500 text-sky-600 dark:text-sky-400"
-            : "border-zinc-300 text-zinc-500 dark:border-zinc-700 dark:text-zinc-400",
+          "flex items-center gap-1.5 rounded border py-1 pl-2 font-mono text-[12px] transition-colors",
+          active.pinned ? "pr-1" : "pr-2",
+          "border-zinc-800 bg-zinc-900 text-zinc-300 hover:border-zinc-700",
         ].join(" ")}
       >
-        {busy ? "…" : label}
-      </button>
+        <button
+          type="button"
+          onClick={() => setOpen((o) => !o)}
+          disabled={busy}
+          aria-haspopup="listbox"
+          aria-expanded={open}
+          title={
+            active.pinned
+              ? `Pinned to ${active.display_name}. It will not fall back to another model.`
+              : `Default routing: ${active.default_id}, falling back automatically if it fails.`
+          }
+          className="flex items-center gap-1.5 disabled:opacity-40"
+        >
+          <span className="text-[10px] uppercase tracking-tight text-zinc-500">Model</span>
+          <span className={active.pinned ? "font-medium text-zinc-100" : "text-zinc-400"}>
+            {busy ? "…" : active.pinned ? active.display_name : "Auto"}
+          </span>
+        </button>
+
+        {active.pinned && (
+          <button
+            type="button"
+            onClick={onReset}
+            disabled={busy}
+            title="Unpin model (switch back to Auto)"
+            aria-label="Unpin model"
+            className="ml-0.5 rounded p-0.5 text-zinc-500 transition-colors hover:bg-zinc-800 hover:text-zinc-200 disabled:opacity-40"
+          >
+            <Icon name="close" className="h-3.5 w-3.5" strokeWidth={2} />
+          </button>
+        )}
+      </div>
 
       {open && (
         <div
           role="listbox"
-          className="absolute right-0 z-20 mt-1 w-64 overflow-hidden rounded-xl border border-zinc-200 bg-white shadow-lg dark:border-zinc-800 dark:bg-zinc-900"
+          className="absolute right-0 z-30 mt-1 w-72 overflow-hidden rounded-lg border border-zinc-800 bg-zinc-925 shadow-2xl"
         >
           <button
             type="button"
@@ -84,46 +107,48 @@ export default function ModelChip({
               setOpen(false);
             }}
             className={[
-              "block w-full px-3 py-2 text-left text-xs hover:bg-zinc-100 dark:hover:bg-zinc-800",
-              !active.pinned ? "font-semibold text-zinc-900 dark:text-zinc-100" : "text-zinc-600 dark:text-zinc-300",
+              "block w-full px-3 py-2 text-left text-xs transition-colors hover:bg-zinc-850",
+              !active.pinned ? "font-semibold text-zinc-100" : "text-zinc-300",
             ].join(" ")}
           >
             Auto
-            <span className="block text-[10px] font-normal text-zinc-400">
+            <span className="mt-0.5 block font-mono text-[10px] font-normal text-zinc-500">
               {active.default_id}, falls back automatically
             </span>
           </button>
 
-          <div className="border-t border-zinc-200 dark:border-zinc-800" />
+          <div className="border-t border-zinc-800" />
 
-          {available.map((model) => {
-            const selected = active.pinned && active.id === model.id;
-            return (
-              <button
-                key={model.id}
-                type="button"
-                role="option"
-                aria-selected={selected}
-                onClick={() => {
-                  onSelect(model.id);
-                  setOpen(false);
-                }}
-                className={[
-                  "block w-full px-3 py-2 text-left text-xs hover:bg-zinc-100 dark:hover:bg-zinc-800",
-                  selected ? "font-semibold text-zinc-900 dark:text-zinc-100" : "text-zinc-600 dark:text-zinc-300",
-                ].join(" ")}
-              >
-                {model.display_name}
-                <span className="block text-[10px] font-normal text-zinc-400">
-                  {model.note || model.id}
-                </span>
-              </button>
-            );
-          })}
+          <div className="max-h-72 overflow-y-auto">
+            {available.map((model) => {
+              const selected = active.pinned && active.id === model.id;
+              return (
+                <button
+                  key={model.id}
+                  type="button"
+                  role="option"
+                  aria-selected={selected}
+                  onClick={() => {
+                    onSelect(model.id);
+                    setOpen(false);
+                  }}
+                  className={[
+                    "block w-full px-3 py-2 text-left text-xs transition-colors hover:bg-zinc-850",
+                    selected ? "font-semibold text-zinc-100" : "text-zinc-300",
+                  ].join(" ")}
+                >
+                  {model.display_name}
+                  <span className="mt-0.5 block font-mono text-[10px] font-normal text-zinc-500">
+                    {model.note || model.id}
+                  </span>
+                </button>
+              );
+            })}
+          </div>
 
-          <div className="border-t border-zinc-200 px-3 py-2 text-[10px] text-zinc-400 dark:border-zinc-800">
+          <div className="border-t border-zinc-800 bg-zinc-950/60 px-3 py-2 text-[10px] leading-relaxed text-zinc-500">
             A pinned model never falls back — if it fails, you get an error, not a
-            different model’s answer.
+            different model&rsquo;s answer.
           </div>
         </div>
       )}

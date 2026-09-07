@@ -1,16 +1,36 @@
 import Link from "next/link";
+import Icon from "@/components/Icon";
 import type { RecalledMemory } from "@/lib/api";
+import type { Persona } from "@/lib/personas";
 
 // No "use client" -- this is presentational only, matching
-// ChatMessageBubble.tsx (the only other non-client component). Renders
-// which stored memories were actually injected into this reply's prompt.
-export default function RecalledMemoryChips({ memories }: { memories: RecalledMemory[] }) {
+// ChatMessageBubble.tsx. Renders which stored memories were actually
+// injected into this reply's prompt.
+
+// The bolt takes the accent of the persona that recalled it, so a chip row
+// stays attached to its message when several replies are on screen. The
+// chip's own chrome stays zinc.
+const BOLT_CLASS: Record<Persona, string> = {
+  jarvis: "text-persona-jarvis",
+  friday: "text-persona-friday",
+  ultron: "text-persona-ultron",
+};
+
+export default function RecalledMemoryChips({
+  memories,
+  persona,
+}: {
+  memories: RecalledMemory[];
+  persona?: Persona | null;
+}) {
   if (memories.length === 0) return null;
 
+  const boltClass = persona ? BOLT_CLASS[persona] : "text-zinc-400";
+
   return (
-    <div className="mt-2 flex flex-wrap items-center gap-1.5">
-      <span className="text-[10px] font-semibold uppercase tracking-wide text-zinc-400 dark:text-zinc-500">
-        Recalled
+    <div className="flex flex-wrap items-center gap-1.5 pt-1">
+      <span className="mr-1 font-mono text-[11px] uppercase tracking-tight text-zinc-500">
+        Recalled:
       </span>
       {memories.map((memory) => (
         // Links into the galaxy and flies the camera to this exact node, so
@@ -22,9 +42,10 @@ export default function RecalledMemoryChips({ memories }: { memories: RecalledMe
           key={memory.id}
           href={`/memory?view=galaxy&focus=${encodeURIComponent(memory.id)}`}
           title={`${memory.content} (similarity ${memory.similarity.toFixed(2)}) — show in the galaxy`}
-          className="max-w-[14rem] truncate rounded-full border border-zinc-300 bg-zinc-50 px-2 py-0.5 text-[11px] text-zinc-600 hover:border-sky-500 hover:text-sky-600 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-400 dark:hover:border-sky-500 dark:hover:text-sky-400"
+          className="inline-flex max-w-[18rem] items-center gap-1 rounded border border-zinc-800 bg-zinc-900 px-2 py-0.5 font-mono text-[12px] text-zinc-300 transition-colors hover:bg-zinc-850 hover:text-zinc-100"
         >
-          {memory.content}
+          <Icon name="bolt" className={`h-3 w-3 shrink-0 ${boltClass}`} strokeWidth={2} />
+          <span className="truncate">{memory.content}</span>
         </Link>
       ))}
     </div>

@@ -1,10 +1,10 @@
 "use client";
 
-import Link from "next/link";
 import { useCallback, useEffect, useRef, useState } from "react";
 import ConversationSidebar from "@/components/ConversationSidebar";
 import MessageList from "@/components/MessageList";
 import ChatInput from "@/components/ChatInput";
+import NoticeStrip, { type NoticeTone } from "@/components/NoticeStrip";
 import PersonaSwitcher from "@/components/PersonaSwitcher";
 import VoiceControls, { type VoiceState } from "@/components/VoiceControls";
 import ModelChip from "@/components/ModelChip";
@@ -19,6 +19,7 @@ import {
   type ChatMessage,
   type ConversationSummary,
   clearActiveModel,
+  deleteConversation,
   getConversation,
   listConversations,
   listModels,
@@ -29,13 +30,21 @@ import {
 } from "@/lib/api";
 import { DEFAULT_PERSONA, FALLBACK_PERSONAS, type Persona, personaLabel } from "@/lib/personas";
 
+/** A notice carries its own tone, so the amber strip keeps meaning
+    "degraded" rather than becoming the channel for every message. */
+interface Notice {
+  tone: NoticeTone;
+  text: string;
+}
+
 export default function Home() {
   const [conversations, setConversations] = useState<ConversationSummary[]>([]);
   const [activeId, setActiveId] = useState<string | null>(null);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [pending, setPending] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [notice, setNotice] = useState<string | null>(null);
+  const [notice, setNotice] = useState<Notice | null>(null);
+  const [deletingId, setDeletingId] = useState<string | null>(null);
   const [persona, setPersona] = useState<Persona>(DEFAULT_PERSONA);
   const [personas, setPersonas] = useState(FALLBACK_PERSONAS);
 
@@ -140,15 +149,49 @@ export default function Home() {
     return () => clearTimeout(timer);
   }, [wakeArmed, wakeArmCount]);
 
-  // Only these lead-ins are treated as a spoken command rather than a
-  // message. Deliberately narrow: "use" and "try" are excluded because
-  // "use simpler words" is a perfectly ordinary thing to say to a chatbot,
-  // and misreading it as a command would swallow the message entirely.
-  const SWAP_COMMAND = /^\s*(switch|swap|change|go back)\b/i;
+  // The spoken command grammar, and it is deliberately narrow.
+  //
+  // This used to be `/^(switch|swap|change|go back)\b/`, which matched the
+  // FIRST WORD and nothing else -- so "change the wording of that", "switch
+  // the order of those two" and "change that to a shorter version" were all
+  // silently consumed as attempts to swap the model, sent to the registry,
+  // refused, and never delivered as messages. Saying an ordinary sentence
+  // and watching the app do something unrelated is exactly that bug.
+  //
+  // The real grammar is `<verb> [back] to <target>`: the "to" has to follow
+  // the verb directly. "change the wording" has no target and is a message;
+  // "change to ULTRON" has one and is a command.
+  const SWAP_COMMAND = /^\s*(?:switch|swap|change|go back)\s+(?:back\s+)?to\s+(.+?)[.!?]*\s*$/i;
+
+  // A target longer than this is a sentence, not a name. "switch to using
+  // shorter sentences from now on please" is something you say to an
+  // assistant, not a model id.
+  const MAX_TARGET_WORDS = 6;
+
+  /** Every name the backend would accept, lowercased, for detection only. */
+  function knownTargets(): string[] {
+    const names = ["auto", "default"];
+    for (const model of availableModels) {
+      names.push(model.id, model.display_name, ...model.aliases);
+    }
+    for (const p of personas) names.push(p.id, p.display_name);
+    return names.map((n) => n.toLowerCase()).filter(Boolean);
+  }
 
   /** Returns true when the utterance was handled as a command, not a message. */
   async function handleSpokenCommand(text: string): Promise<boolean> {
-    if (!SWAP_COMMAND.test(text)) return false;
+    const match = text.match(SWAP_COMMAND);
+    if (!match) return false;
+
+    const target = match[1].trim();
+    if (target.split(/\s+/).length > MAX_TARGET_WORDS) return false;
+
+    // Detection, not resolution. The client only decides "is this a command
+    // at all"; which model a name means stays the backend registry's single
+    // decision (app/llm/registry.py), which is why the whole spoken string
+    // is still handed to it below rather than a name resolved here.
+    const lowered = target.toLowerCase();
+    if (!knownTargets().some((name) => lowered.includes(name))) return false;
 
     // Personas first: "switch to FRIDAY" is about voice and tone, and would
     // otherwise be refused by the model registry with a confusing message
@@ -157,10 +200,13 @@ export default function Home() {
     // backslash-b is a backspace character, so the word-boundary anchors
     // would silently never match and every spoken persona switch would
     // fall through to the model registry and be refused.
-    const wanted = personas.find((p) => new RegExp(`\\b${p.id}\\b`, "i").test(text));
+    const wanted = personas.find((p) => new RegExp(`\\b${p.id}\\b`, "i").test(target));
     if (wanted) {
       setPersona(wanted.id);
-      setNotice(`Switched to ${wanted.display_name}.`);
+      // Quotes what was heard, not just what was done. When speech is
+      // mis-transcribed the only way to tell is seeing the words the app
+      // acted on -- "Switched to FRIDAY" alone hides the misheard input.
+      setNotice({ tone: "zinc", text: `Heard “${text}” — switched to ${wanted.display_name}.` });
       return true;
     }
 
@@ -168,11 +214,12 @@ export default function Home() {
     try {
       const active = await setActiveModel(text);
       setActiveModelState(active);
-      setNotice(
-        active.pinned
-          ? `Now thinking on ${active.display_name}. It will not fall back to another model.`
-          : `Back to default routing (${active.default_id}).`
-      );
+      setNotice({
+        tone: "zinc",
+        text: active.pinned
+          ? `Heard “${text}” — now thinking on ${active.display_name}. It will not fall back to another model.`
+          : `Heard “${text}” — back to default routing (${active.default_id}).`,
+      });
     } catch (err) {
       // The backend refused rather than guessing at the nearest model, and
       // its message lists what actually exists -- show it verbatim.
@@ -187,37 +234,37 @@ export default function Home() {
   // whichever is not selected simply never gets started, so it holds no
   // microphone and does no work.
   const handleUtterance = (text: string) => {
-      // Barge-in: talking over the assistant stops it, rather than queueing
-      // a reply behind a paragraph you already interrupted.
-      speech.cancel();
-      if (pendingRef.current) {
-        setDroppedUtterance(true);
+    // Barge-in: talking over the assistant stops it, rather than queueing
+    // a reply behind a paragraph you already interrupted.
+    speech.cancel();
+    if (pendingRef.current) {
+      setDroppedUtterance(true);
+      return;
+    }
+    setDroppedUtterance(false);
+
+    let spoken = text;
+    if (handsFreeRef.current) {
+      const { matched, remainder } = matchWakePhrase(text);
+      const withinFollowUp = wakeArmedRef.current;
+      if (matched) {
+        armWakeWindow();
+        // The name on its own opens the floor rather than being sent
+        // as a message -- "hey cipher" is not a question.
+        if (!remainder) return;
+        spoken = remainder;
+      } else if (!withinFollowUp) {
+        // Not addressed to us. Dropped silently and on purpose: the
+        // entire point of hands-free is that ambient conversation in
+        // the room is not a prompt.
         return;
       }
-      setDroppedUtterance(false);
+    }
 
-      let spoken = text;
-      if (handsFreeRef.current) {
-        const { matched, remainder } = matchWakePhrase(text);
-        const withinFollowUp = wakeArmedRef.current;
-        if (matched) {
-          armWakeWindow();
-          // The name on its own opens the floor rather than being sent
-          // as a message -- "hey cipher" is not a question.
-          if (!remainder) return;
-          spoken = remainder;
-        } else if (!withinFollowUp) {
-          // Not addressed to us. Dropped silently and on purpose: the
-          // entire point of hands-free is that ambient conversation in
-          // the room is not a prompt.
-          return;
-        }
-      }
-
-      void (async () => {
-        if (await handleSpokenCommand(spoken)) return;
-        await handleSend(spoken);
-      })();
+    void (async () => {
+      if (await handleSpokenCommand(spoken)) return;
+      await handleSend(spoken);
+    })();
   };
 
   const handleInterrupt = () => speech.cancel();
@@ -231,9 +278,10 @@ export default function Home() {
     onFatal: () => {
       setSttBackend("whisper");
       resumeOnFallbackRef.current = true;
-      setNotice(
-        "This browser's speech service is unavailable, so speech is now being transcribed on the server instead."
-      );
+      setNotice({
+        tone: "amber",
+        text: "This browser's speech service is unavailable, so speech is now being transcribed on the server instead.",
+      });
     },
   });
 
@@ -310,6 +358,40 @@ export default function Home() {
     }
   }
 
+  async function handleDeleteConversation(conversation: ConversationSummary) {
+    const title = conversation.title || "this conversation";
+    // Confirmed in the browser because it cannot be undone -- there is no
+    // trash and no restore. Matches the memory dashboard's "Forget
+    // everything", which is the other irreversible action in the app.
+    if (!window.confirm(`Delete “${title}”? Its messages are gone for good.`)) return;
+
+    setError(null);
+    setNotice(null);
+    setDeletingId(conversation.id);
+    try {
+      const result = await deleteConversation(conversation.id);
+      setConversations((prev) => prev.filter((c) => c.id !== conversation.id));
+      // Deleting the thread you are reading has to clear the thread too,
+      // or the transcript stays on screen pointing at a conversation the
+      // next message would fail to append to.
+      if (activeId === conversation.id) {
+        setActiveId(null);
+        setMessages([]);
+      }
+      setNotice({
+        tone: "zinc",
+        text:
+          result.agent_runs_detached > 0
+            ? `Deleted “${title}”. Its ${result.agent_runs_detached} agent ${result.agent_runs_detached === 1 ? "run" : "runs"} stay in the activity trail.`
+            : `Deleted “${title}”.`,
+      });
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : "Could not delete that conversation.");
+    } finally {
+      setDeletingId(null);
+    }
+  }
+
   function handleNewChat() {
     setActiveId(null);
     setMessages([]);
@@ -329,7 +411,10 @@ export default function Home() {
     if (screen.sharing) {
       const frame = await screen.capture();
       if (!frame) {
-        setNotice("The screen share ended, so there was nothing to look at. Start it again to ask about your screen.");
+        setNotice({
+          tone: "amber",
+          text: "The screen share ended, so there was nothing to look at. Start it again to ask about your screen.",
+        });
         return;
       }
       const optimistic: ChatMessage = {
@@ -397,13 +482,20 @@ export default function Home() {
         // A specialist was attempted and failed. Saying so matters more than
         // it looks: the reply that follows is ungrounded, and the user would
         // otherwise assume it had been looked up.
-        setNotice(`Couldn't look that up — ${result.activity}. Answered without it.`);
+        setNotice({
+          tone: "amber",
+          text: `Couldn't look that up — ${result.activity}. Answered without it.`,
+        });
       } else if (result.filtered) {
-        setNotice(
-          `${personaLabel(personas, result.message.persona)}'s safety filter replaced that reply -- it crossed a line the persona enforces.`
-        );
+        setNotice({
+          tone: "red",
+          text: `${personaLabel(personas, result.message.persona)}'s safety filter replaced that reply — it crossed a line the persona enforces.`,
+        });
       } else if (result.fell_back) {
-        setNotice(`Primary model was unavailable — replied using the fallback model (${result.model_used}).`);
+        setNotice({
+          tone: "amber",
+          text: `Primary model was unavailable — answered on the fallback model (${result.model_used}).`,
+        });
       }
       refreshConversations();
     } catch (err) {
@@ -470,6 +562,7 @@ export default function Home() {
   }
 
   const activeLabel = personaLabel(personas, persona);
+  const activeTagline = personas.find((p) => p.id === persona)?.tagline ?? "";
 
   // Order matters. "dropped" deliberately outranks "thinking": the reply in
   // flight is the *reason* the utterance was dropped, so reporting "thinking"
@@ -490,22 +583,47 @@ export default function Home() {
               ? "waiting"
               : "listening";
 
+  const screenStatus = screen.error
+    ? screen.error
+    : screen.sharing
+      ? `${activeLabel} can see the shared window — every question grabs a fresh frame.`
+      : "";
+
   return (
-    <div className="flex flex-1 bg-white dark:bg-black">
+    <div className="flex h-full w-full overflow-hidden">
       <ConversationSidebar
         conversations={conversations}
         activeId={activeId}
         personas={personas}
+        busyId={deletingId}
         onSelect={handleSelectConversation}
         onNewChat={handleNewChat}
+        onDelete={handleDeleteConversation}
       />
-      <div className="flex flex-1 flex-col">
-        <header className="flex items-center justify-between border-b border-zinc-200 px-4 py-3 dark:border-zinc-800">
-          <h1 className="text-sm font-semibold tracking-wide text-zinc-900 dark:text-zinc-100">
-            CIPHER — {activeLabel}
-          </h1>
-          <div className="flex items-center gap-3">
-            <PersonaSwitcher personas={personas} value={persona} onChange={setPersona} disabled={pending} />
+
+      <main className="relative flex h-full flex-1 flex-col overflow-hidden bg-zinc-950">
+        <header className="z-20 flex h-12 shrink-0 select-none items-center justify-between border-b border-zinc-800 bg-zinc-925 px-4">
+          <div className="flex min-w-0 items-center gap-3">
+            <span className="hidden font-mono text-[11px] uppercase tracking-wider text-zinc-500 sm:inline-block">
+              Persona:
+            </span>
+            <PersonaSwitcher
+              personas={personas}
+              value={persona}
+              onChange={setPersona}
+              disabled={pending}
+            />
+            {/* Hidden below xl rather than md: at 1024 it truncates to a few
+                characters and sits flush against the model chip, which reads
+                as an overlap. */}
+            {activeTagline && (
+              <span className="hidden truncate border-l border-zinc-800 pl-3 font-mono text-[11px] text-zinc-500 xl:inline-block">
+                {activeTagline}
+              </span>
+            )}
+          </div>
+
+          <div className="flex shrink-0 items-center gap-2">
             <ModelChip
               active={activeModel}
               available={availableModels}
@@ -513,43 +631,13 @@ export default function Home() {
               onSelect={handleSelectModel}
               onReset={handleResetModel}
             />
-            <Link
-              href="/control"
-              className="text-xs font-semibold uppercase tracking-wide text-zinc-500 hover:text-zinc-900 dark:text-zinc-400 dark:hover:text-zinc-100"
-            >
-              Control
-            </Link>
-            <Link
-              href="/agents"
-              className="text-xs font-semibold uppercase tracking-wide text-zinc-500 hover:text-zinc-900 dark:text-zinc-400 dark:hover:text-zinc-100"
-            >
-              Agents
-            </Link>
-            <Link
-              href="/documents"
-              className="text-xs font-semibold uppercase tracking-wide text-zinc-500 hover:text-zinc-900 dark:text-zinc-400 dark:hover:text-zinc-100"
-            >
-              Docs
-            </Link>
-            <Link
-              href="/memory"
-              className="text-xs font-semibold uppercase tracking-wide text-zinc-500 hover:text-zinc-900 dark:text-zinc-400 dark:hover:text-zinc-100"
-            >
-              Memory
-            </Link>
           </div>
         </header>
 
-        {notice && (
-          <div className="border-b border-amber-200 bg-amber-50 px-4 py-2 text-xs text-amber-800 dark:border-amber-900 dark:bg-amber-950 dark:text-amber-300">
-            {notice}
-          </div>
-        )}
-        {error && (
-          <div className="border-b border-red-200 bg-red-50 px-4 py-2 text-xs text-red-800 dark:border-red-900 dark:bg-red-950 dark:text-red-300">
-            {error}
-          </div>
-        )}
+        {/* Degraded-state strips sit directly under the header, above the
+            thread — where they are read before the reply they qualify. */}
+        {notice && <NoticeStrip tone={notice.tone}>{notice.text}</NoticeStrip>}
+        {error && <NoticeStrip tone="red">{error}</NoticeStrip>}
 
         <MessageList
           messages={messages}
@@ -557,46 +645,36 @@ export default function Home() {
           activePersonaLabel={activeLabel}
           personas={personas}
         />
-        {screen.supported && (
-          <div className="flex items-center gap-3 border-t border-zinc-200 px-4 py-2 dark:border-zinc-800">
-            <button
-              type="button"
-              onClick={() => (screen.sharing ? screen.stop() : void screen.start())}
-              className={[
-                "shrink-0 rounded-lg border px-3 py-1 text-xs font-semibold",
-                screen.sharing
-                  ? "border-red-500 bg-red-500 text-white"
-                  : "border-zinc-300 text-zinc-600 hover:border-zinc-500 dark:border-zinc-700 dark:text-zinc-300",
-              ].join(" ")}
-            >
-              {screen.sharing ? "Stop sharing" : "Show your screen"}
-            </button>
-            <p className="truncate text-xs text-zinc-500 dark:text-zinc-400">
-              {screen.error
-                ? screen.error
-                : screen.sharing
-                  ? `${activeLabel} can see the shared window. Every question grabs a fresh frame.`
-                  : "Share a window and ask about what is on it."}
-            </p>
-          </div>
-        )}
-        <VoiceControls
-          state={voiceState}
-          micOn={mic.enabled}
-          handsFree={handsFree}
-          onToggleHandsFree={handleToggleHandsFree}
-          interim={mic.interim}
-          error={mic.error}
-          persona={persona}
-          personaLabel={activeLabel}
-          voiceReplies={voiceReplies}
-          outputSupported={speech.supported}
-          onToggleMic={handleToggleMic}
-          onToggleVoiceReplies={handleToggleVoiceReplies}
-          onStopSpeaking={speech.cancel}
-        />
-        <ChatInput disabled={pending} personaLabel={activeLabel} onSend={handleSend} />
-      </div>
+
+        <div className="flex shrink-0 flex-col border-t border-zinc-800 bg-zinc-925/90">
+          <VoiceControls
+            state={voiceState}
+            micOn={mic.enabled}
+            handsFree={handsFree}
+            onToggleHandsFree={handleToggleHandsFree}
+            interim={mic.interim}
+            error={mic.error}
+            persona={persona}
+            personaLabel={activeLabel}
+            voiceReplies={voiceReplies}
+            outputSupported={speech.supported}
+            onToggleVoiceReplies={handleToggleVoiceReplies}
+            onStopSpeaking={speech.cancel}
+          />
+          <ChatInput
+            disabled={pending}
+            personaLabel={activeLabel}
+            onSend={handleSend}
+            micOn={mic.enabled}
+            micSupported={mic.supported}
+            onToggleMic={handleToggleMic}
+            screenSupported={screen.supported}
+            screenSharing={screen.sharing}
+            screenStatus={screenStatus}
+            onToggleScreenShare={() => (screen.sharing ? screen.stop() : void screen.start())}
+          />
+        </div>
+      </main>
     </div>
   );
 }
