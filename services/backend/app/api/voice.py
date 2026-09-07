@@ -29,7 +29,7 @@ from groq import APIError, AsyncGroq
 
 from app.api.deps import get_current_user_id
 from app.core.config import Settings, get_settings
-from app.core.ratelimit import CHAT_RULE, RateLimiter, get_rate_limiter
+from app.core.ratelimit import TRANSCRIBE_RULE, RateLimiter, get_rate_limiter
 from app.models.schemas import TranscriptionResponse
 
 logger = logging.getLogger(__name__)
@@ -59,10 +59,13 @@ async def transcribe(
     settings: Settings = Depends(get_settings),
     rate_limiter: RateLimiter = Depends(get_rate_limiter),
 ) -> TranscriptionResponse:
-    # Shares the chat rule and its own key: transcription is per-utterance,
-    # so it is bounded by the same "how fast can a person talk" ceiling, and
-    # a stuck recorder should not eat the chat allowance.
-    allowed, retry_after = rate_limiter.check(f"transcribe:{user_id}", CHAT_RULE)
+    # Its own rule, not the chat one. Transcription is cheap next to a chat
+    # turn -- one small Whisper call against a routing call plus a reply plus
+    # possibly a tool and an embedding -- and the two were only ever sharing
+    # a number because they had the same rough shape. They do not: a person
+    # speaking naturally produces several short utterances per message, so
+    # the chat ceiling was reached first by the path that costs least.
+    allowed, retry_after = rate_limiter.check(f"transcribe:{user_id}", TRANSCRIBE_RULE)
     if not allowed:
         raise HTTPException(
             status_code=429,
@@ -92,6 +95,14 @@ async def transcribe(
         result = await client.audio.transcriptions.create(
             file=(filename, data),
             model=TRANSCRIBE_MODEL,
+            # Whisper is a generative model, and on quiet or ambiguous audio
+            # it will happily invent fluent filler -- "Thank you.", "you",
+            # the subtitle credits from its training data. Sampling is what
+            # makes that likely; 0 makes it merely possible. The real defence
+            # is the client-side voice detector, which no longer uploads
+            # anything without speech in it, but the two are independent and
+            # this one costs nothing.
+            temperature=0,
             **({"language": language} if language else {}),
         )
     except APIError as exc:

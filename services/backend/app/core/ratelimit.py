@@ -39,6 +39,15 @@ CHAT_RULE = RateLimitRule(limit=20, window_seconds=60)
 #: Uploads embed a whole document. Deliberately tighter.
 UPLOAD_RULE = RateLimitRule(limit=10, window_seconds=60)
 
+#: Transcription used to share CHAT_RULE, and that was wrong twice over. It
+#: is far cheaper -- one small Whisper call, against a chat turn's routing
+#: call plus reply plus possibly a tool and an embedding -- and it is far
+#: more frequent, because one spoken message is several utterances. Sharing
+#: the chat number meant the cheap path exhausted the expensive path's
+#: allowance. 40/minute is well above a person talking continuously and
+#: still low enough that a stuck recorder is caught within seconds.
+TRANSCRIBE_RULE = RateLimitRule(limit=40, window_seconds=60)
+
 
 class RateLimiter:
     def __init__(self) -> None:

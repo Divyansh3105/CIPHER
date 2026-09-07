@@ -33,7 +33,7 @@ async def test_transcription_is_rate_limited(client, monkeypatch):
     """A stuck recorder must not be able to spend the whole quota, and must
     not eat the chat allowance either -- it has its own key.
     """
-    from app.core.ratelimit import CHAT_RULE, get_rate_limiter
+    from app.core.ratelimit import TRANSCRIBE_RULE, get_rate_limiter
 
     from app.api.deps import get_current_user_id
     from app.main import app
@@ -45,8 +45,8 @@ async def test_transcription_is_rate_limited(client, monkeypatch):
     limiter = get_rate_limiter()
     # Fill this endpoint's bucket directly; the payload below is under the
     # minimum, so no real transcription is attempted.
-    for _ in range(CHAT_RULE.limit):
-        limiter.check(f"transcribe:{user_id}", CHAT_RULE)
+    for _ in range(TRANSCRIBE_RULE.limit):
+        limiter.check(f"transcribe:{user_id}", TRANSCRIBE_RULE)
 
     response = await client.post(
         "/voice/transcribe",
