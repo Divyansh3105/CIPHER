@@ -836,9 +836,22 @@ Runs at http://localhost:3000.
 Other frontend commands:
 ```bash
 npm run lint    # ESLint
+npm run vad     # voice-detector checks (synthesised audio, no microphone needed)
 npm run build   # production build
 npm run start   # serve the production build
 ```
+
+> **On Windows, prefer `npm ci` to `npm install` here.** `npm install` on Windows
+> silently drops `@emnapi/core` and `@emnapi/runtime` from `package-lock.json`.
+> They look unused locally — `sharp` resolves to `@img/sharp-win32-x64` and the
+> wasm32 variant that needs them is never reached — but CI installs on Linux,
+> reaches it, and `npm ci` then refuses the whole tree with
+> `Missing: @emnapi/runtime@... from lock file`. If it happens, regenerate the
+> lock on the platform CI uses rather than editing it by hand:
+>
+> ```bash
+> docker run --rm -v "$PWD:/w" -w /w node:22-bookworm npm install --package-lock-only
+> ```
 
 ### Deployment
 
