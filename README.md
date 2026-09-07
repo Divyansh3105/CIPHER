@@ -48,7 +48,7 @@ Rather than exposing one fixed assistant personality, CIPHER lets the user switc
 - Multi-agent orchestration (research, memory, coding agents)
 - Permissioned computer/automation control with a kill switch and audit log
 
-**Current status:** Phase 0 (planning and scaffolding) is complete. Phase 1 (single-persona core MVP chat) is complete and verified live — real messages sent through the UI are persisted in Postgres and answered by Gemini, with an automatic Groq fallback. Phase 2 (the JARVIS/FRIDAY/ULTRON personality system, with a per-message switcher and ULTRON's safety filter) is also complete and verified live. Phase 3 (long-term memory via `pgvector`, hybrid capture, and a memory dashboard) is complete and verified live as well. Phase 4 is **in progress**: a browser-native voice loop and a runtime model swap are built and verified live, while a `preflight.py` live-chain harness, a 3D memory galaxy, and wake-word detection are still outstanding (see [Section 6](#6-current-project-status)). The full phase-by-phase design lives in [`docs/architecture.md`](docs/architecture.md).
+**Current status:** Phase 0 (planning and scaffolding) is complete. Phase 1 (single-persona core MVP chat) is complete and verified live — real messages sent through the UI are persisted in Postgres and answered by Gemini, with an automatic Groq fallback. Phase 2 (the JARVIS/FRIDAY/ULTRON personality system, with a per-message switcher and ULTRON's safety filter) is also complete and verified live. Phase 3 (long-term memory via `pgvector`, hybrid capture, and a memory dashboard) is complete and verified live as well. Phases 4 through 8 are complete and verified live as well — voice with a runtime model swap and a `preflight.py` live-chain harness, web search and document RAG, a multi-agent orchestrator, vision and permissioned automation, and production hardening — leaving only the public deploy, which needs accounts only the owner has (see [Section 6](#6-current-project-status)). Speech input has since stopped depending on Chrome: the browser's own service is tried first, and the app switches itself to server-side Whisper transcription when that service cannot be reached. The full phase-by-phase design lives in [`docs/architecture.md`](docs/architecture.md).
 
 ---
 
@@ -102,7 +102,7 @@ Rather than exposing one fixed assistant personality, CIPHER lets the user switc
 | AI/ML | Google Gemini (`gemini-3.6-flash`) via `google-genai`; Groq (`openai/gpt-oss-120b`) via `groq` | Primary and automatic-fallback response generation |
 | Vector memory | `pgvector` extension on Supabase Postgres; `gemini-embedding-001` (768 dims) via `google-genai` | Long-term memory storage and similarity search (Phase 3) — no new Python dependency, since embeddings go through the same `google-genai` client already used for chat |
 | Authentication | Supabase Auth — **planned, not yet implemented** | Phase 1 uses a single seeded dev user instead (see [Section 5](#5-development-phases)) |
-| Voice | Browser Web Speech API (`webkitSpeechRecognition`, `speechSynthesis`) | Speech in and out, Phase 4 — zero dependencies and zero cost, but Chrome/Edge-only and recognition audio goes to Google; contained in `apps/web/src/lib/speech.ts` so a Whisper/Edge-TTS backend can slot in behind it |
+| Voice | Browser Web Speech API (`webkitSpeechRecognition`, `speechSynthesis`), falling back to Groq `whisper-large-v3-turbo` via `POST /voice/transcribe` | Speech in and out, Phase 4 — the browser path is instant, keyless and free, but its recognition half only reaches Google's speech service inside Google Chrome, so a failure switches the app to recording with `MediaRecorder` and transcribing on the server with the `GROQ_API_KEY` already required. Both sit behind one `SpeechInput` interface, so the page does not know which is running |
 | Testing | pytest, pytest-asyncio, httpx, aiosqlite | Backend unit + integration tests, run against an in-memory DB |
 | Deployment | **Not yet configured.** Planned: Vercel (frontend) + Render/Railway (backend) + Supabase (DB), per `docs/architecture.md` Section 19 | — |
 | Other | ESLint (`eslint-config-next`), Turbopack (via `next dev`) | Linting; dev-server bundling |
@@ -438,6 +438,8 @@ Only technologies actually present in the codebase or `requirements.txt`/`packag
 
 **Known and unexplained:** four memories present in the live store at the start of the session were gone an hour later. The test suite was ruled out (it resolves to a throwaway localhost database, verified directly) and no deletion path was identified. Recorded rather than guessed at; preflight now round-trips a real write and read on every run, which would surface a recurrence.
 
+**Follow-up after Phase 8 — speech input no longer depends on Chrome.** The Chrome-only constraint bit, in the most misleading way available: outside Google Chrome `webkitSpeechRecognition` frequently *exists* and always fails with `error: "network"`, because Chromium forks (Brave, ungoogled builds, embedded webviews) ship the interface without Google's speech backend credentials, and Firefox and Safari do not implement it at all. The old handler took the error at face value and told the user to check their connection, which was never the problem. The browser path is still tried first — instant, free, no round trip — but on that specific failure the app now switches itself to recording with `MediaRecorder` and posting each utterance to `POST /voice/transcribe`, which runs Groq's hosted `whisper-large-v3-turbo` on the `GROQ_API_KEY` the project already requires. No new credential and no local model download. The switch is automatic and mid-attempt: the user clicked the mic once, and making them click again after a failure they did not cause is friction with no purpose. The recorder path has to solve something the browser API solved for free — knowing where an utterance ends — so it measures RMS from a WebAudio analyser and applies the same `FINISH_MS` rule, since cutting on the first quiet moment truncates a sentence exactly as it did before. It is also the more private of the two: the browser API streams audio to Google continuously while the mic is open, where this sends one clip per utterance to a provider the project already talks to. Four backend tests cover the endpoint (full suite **303/303**), and it was verified live twice — a real recording transcribed word for word, and a deliberately failing recogniser proving the app starts the recorder on its own. Text-to-speech stays on `speechSynthesis`, which is genuinely universal.
+
 **Phase Status:** ✅ Completed — voice loop, runtime model swap, preflight harness, keyless wake word, and 3D memory galaxy are all built and verified live. 183/183 backend tests, 23/23 preflight checks, clean production build.
 
 ---
@@ -756,6 +758,7 @@ flowchart LR
 - [x] `/memory` dashboard — view, edit, delete individual memories, and a confirmed "Forget everything"
 - [x] "Recalled" chips on chat replies that persist across a reload
 - [x] Voice input and output in the browser — mic button, pause-tolerant transcription (`FINISH_MS`), spoken replies in each persona’s voice, echo suppression while speaking, and “stop” as a spoken interrupt
+- [x] Speech-to-text that works outside Chrome — when the browser's own speech service is unreachable, the app falls back on its own to `POST /voice/transcribe` (Groq `whisper-large-v3-turbo`), recording with `MediaRecorder` and ending utterances on measured silence
 - [x] Runtime model swap — pin any of seven live-verified models mid-conversation from a header chip or by voice, with unknown names refused rather than resolved to the nearest match, and no silent fallback while pinned
 - [x] `scripts/verify_models.py` — proves every offered model answers a real call, which caught two that the provider’s own model list advertises but 404s on
 - [x] Keyless wake word — “hey CIPHER” matched in the live transcript, with a follow-up window so a conversation does not need the name every turn; no Picovoice account or key
@@ -778,11 +781,10 @@ flowchart LR
 - [x] Non-root multi-stage container, verified by running it against the real database
 - [x] GitHub Actions CI — backend tests, frontend lint/typecheck/build, image build
 - [x] Deployment runbook (`docs/deployment.md`)
-- [x] Backend automated test suite (299 tests, in-memory database, no live credentials needed)
+- [x] Backend automated test suite (303 tests, in-memory database, no live credentials needed)
 
 ### Planned
 - [ ] Real user authentication via Supabase Auth
-- [ ] Speech-to-text off the browser (Groq `whisper-large-v3`, or local Whisper), if the Chrome-only constraint starts to bite
 
 ---
 
@@ -877,7 +879,7 @@ No API keys, passwords, tokens, or other credentials are included in this docume
 - **Deploy it.** Follow `docs/deployment.md`: create the Vercel and Render projects, set the environment variables, run `alembic upgrade head`, and send one real message through the deployed frontend.
 - Add real authentication (Supabase Auth), replacing the single seeded dev user. Everything is already scoped by `user_id`, so this stays a change to `get_current_user_id` rather than a migration of anything.
 - Grow `scripts/preflight.py` by one check per real incident. It is already the fastest way to tell whether the system actually works, and every check in it was earned by something that broke.
-- Decide whether to move STT/TTS off the browser. Groq serves `whisper-large-v3` on the existing `GROQ_API_KEY` — hosted Whisper with no local model download and no new credential, and the only thing keeping voice Chrome-only.
+- Decide whether TTS needs to follow STT off the browser. STT already has: `POST /voice/transcribe` takes over automatically wherever the browser's speech service is unreachable. `speechSynthesis` has not needed the same treatment because every browser implements it — but the voice inventory differs per platform, so a persona can sound like someone else on a different machine.
 
 ### Medium-Term
 - Real user authentication via Supabase Auth, replacing the single seeded dev user — memory is already scoped by `user_id` throughout, so this is expected to be a drop-in change to `get_current_user_id`.

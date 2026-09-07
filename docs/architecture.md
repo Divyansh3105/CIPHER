@@ -297,7 +297,7 @@ The shipped voice loop uses the **browser's own Web Speech API** in both directi
 | --- | --- | --- |
 | Cost | Free | Free |
 | Setup | Model download, audio pipeline, ffmpeg | None |
-| Browser support | Any | **Chrome/Edge only** |
+| Browser support | Any | Any — browser API first, server transcription when it fails |
 | Privacy | Local, offline-capable | **Audio goes to Google's servers** |
 | Latency | Depends on local CPU | Near-instant |
 
@@ -314,7 +314,13 @@ The privacy and browser-support columns are real costs, and the reason this is a
 - **Match the phrase in the transcript.** Recognition already streams text continuously, so "hey cipher" can be detected client-side with no new dependency and no account.
 - **openWakeWord** (MIT) runs a local ONNX model in Python — no signup, no key, fully offline.
 
-**A third STT option found while auditing model availability:** Groq serves `whisper-large-v3` and `whisper-large-v3-turbo` on the `GROQ_API_KEY` this project already has. That is hosted Whisper with no local model download and no new credential — likely a better second step than local Whisper if the browser API's constraints start to bite.
+**They bit, and the fallback shipped.** `webkitSpeechRecognition` has a failure mode that reads as a network fault and is not: outside Google Chrome the API frequently *exists* and always fails with `error: "network"`, because Chromium forks ship the interface without Google's speech backend credentials. Firefox and Safari do not implement it at all. So the browser API is tried first (instant, free, no round trip) and, on that specific failure, the app switches itself to recording with MediaRecorder and posting each utterance to `POST /voice/transcribe`, which uses Groq's hosted `whisper-large-v3-turbo` on the `GROQ_API_KEY` the project already requires. No new credential, no local model download, and it works in every browser that can record audio.
+
+The switch is automatic and mid-attempt: the user clicked the microphone once, and making them click again after a failure they did not cause is friction with no purpose.
+
+The recorder path has to solve something the browser API solved for free — knowing where an utterance ends. It measures RMS from a WebAudio analyser and applies the same `FINISH_MS` rule: silence has to persist for the whole finish window before the clip is closed and sent, because people pause mid-sentence and cutting on the first quiet moment truncates roughly every other utterance.
+
+It is also the more private of the two. The browser API streams audio to Google continuously while the microphone is open; this sends one clip per utterance to a provider the project already talks to.
 
 ---
 
@@ -484,6 +490,10 @@ notifications
 
 /vision                         # built in Phase 7
   POST   /vision                # one uploaded frame + a question
+
+/voice
+  POST   /voice/transcribe      # one recorded utterance -> text (Groq Whisper)
+  # /voice/synthesize is still NOT built: speechSynthesis works everywhere.
 
 /agents                         # built in Phase 6
   GET    /agents                # registered specialists, and whether each is switched on
