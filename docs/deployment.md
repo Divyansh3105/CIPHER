@@ -79,6 +79,7 @@ deleting a file in a later layer does not remove it from an earlier one.
    | `DATABASE_URL` | the transaction-mode pooler (port 6543) |
    | `MIGRATION_DATABASE_URL` | the session-mode pooler (port 5432) |
    | `AUTOMATION_ENABLED` | **leave unset** — see the warning below |
+   | `AUTH_DISABLED` | **leave unset** — with it on, anyone with the URL is the dev user |
 
 `FRONTEND_URL` is the CORS allowlist (`app/main.py`). A trailing slash or an
 `http://` where the browser sends `https://` produces a CORS failure that
@@ -105,7 +106,16 @@ matters, the fix is a paid instance, not a code change.
 1. Vercel → New Project → import this repository.
 2. **Root directory: `apps/web`.** Without this, Vercel builds the repository
    root and finds no Next.js app.
-3. Environment variable: `NEXT_PUBLIC_API_URL` = your Render backend URL.
+3. Environment variables:
+
+   | Variable | Value |
+   | --- | --- |
+   | `NEXT_PUBLIC_API_URL` | your Render backend URL |
+   | `NEXT_PUBLIC_SUPABASE_URL` | same as the backend's `SUPABASE_URL` |
+   | `NEXT_PUBLIC_SUPABASE_ANON_KEY` | the **anon** key — never `service_role`, which bypasses every row policy and would ship to every visitor |
+
+4. Supabase → Authentication → URL Configuration: set **Site URL** to your
+   Vercel URL, or confirmation emails link back to `localhost:3000`.
 
 `NEXT_PUBLIC_` values are **baked into the build**, not read at runtime.
 Changing this variable requires a redeploy; changing it in the dashboard

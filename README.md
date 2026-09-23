@@ -101,7 +101,7 @@ Rather than exposing one fixed assistant personality, CIPHER lets the user switc
 | ORM / Migrations | SQLAlchemy 2.0 (async) + asyncpg, Alembic | Async DB access; versioned schema migrations |
 | AI/ML | Google Gemini (`gemini-3.6-flash`) via `google-genai`; Groq (`openai/gpt-oss-120b`) via `groq` | Primary and automatic-fallback response generation |
 | Vector memory | `pgvector` extension on Supabase Postgres; `gemini-embedding-001` (768 dims) via `google-genai` | Long-term memory storage and similarity search (Phase 3) — no new Python dependency, since embeddings go through the same `google-genai` client already used for chat |
-| Authentication | Supabase Auth — **planned, not yet implemented** | Phase 1 uses a single seeded dev user instead (see [Section 5](#5-development-phases)) |
+| Authentication | Supabase Auth (email + password) | The backend verifies each request's ES256 token against the project's public keys — it holds no secret that can mint one |
 | Voice | Browser Web Speech API (`webkitSpeechRecognition`, `speechSynthesis`), falling back to Groq `whisper-large-v3-turbo` via `POST /voice/transcribe` | Speech in and out, Phase 4 — the browser path is instant, keyless and free, but its recognition half only reaches Google's speech service inside Google Chrome, so a failure switches the app to capturing audio and transcribing it on the server with the `GROQ_API_KEY` already required. The server path runs its own voice-activity detector (`apps/web/src/lib/audio.ts`) so it only ever uploads audio someone actually spoke into, and the choice is remembered and switchable by hand. Both sit behind one `SpeechInput` interface, so the page does not know which is running |
 | Testing | pytest, pytest-asyncio, httpx, aiosqlite | Backend unit + integration tests, run against an in-memory DB |
 | Deployment | **Not yet configured.** Planned: Vercel (frontend) + Render/Railway (backend) + Supabase (DB), per `docs/architecture.md` Section 19 | — |
@@ -783,8 +783,7 @@ flowchart LR
 - [x] Deployment runbook (`docs/deployment.md`)
 - [x] Backend automated test suite (303 tests, in-memory database, no live credentials needed)
 
-### Planned
-- [ ] Real user authentication via Supabase Auth
+- [x] Real user authentication via Supabase Auth (every router guarded; `/health` stays public)
 
 ---
 
@@ -869,18 +868,17 @@ All variables are read from a single repo-root `.env` file (see `.env.example` f
 | `APP_PORT` | Backend port | No — defaults to `8000` |
 | `FRONTEND_URL` | Allowed CORS origin for the frontend | No — defaults to `http://localhost:3000` |
 | `NEXT_PUBLIC_API_URL` | Base URL the frontend uses to call the backend | No — defaults to `http://localhost:8000` |
-| `SUPABASE_URL` | Supabase project URL | No — reserved for Auth/Storage in a later phase, not yet used by the app |
-| `SUPABASE_KEY` | Supabase anon/service key | No — reserved for a later phase |
-| `SUPABASE_JWT_SECRET` | Verifies Supabase Auth JWTs | No — reserved for a later phase (auth not yet implemented) |
+| `SUPABASE_URL` | Supabase project URL; the backend fetches the auth signing keys from it | **Yes** |
+| `SUPABASE_KEY` | Supabase **anon** key, sent when fetching signing keys | **Yes** |
 | `DATABASE_URL` | Postgres connection string used at request time (Supavisor transaction-mode pooler recommended) | **Yes** |
 | `MIGRATION_DATABASE_URL` | Non-pooled Postgres connection used by Alembic for schema changes | No — falls back to `DATABASE_URL` |
-| `DEV_USER_ID` | Fixed UUID every request is attributed to while real auth doesn't exist yet | No — has a built-in default |
+| `AUTH_DISABLED` | Lets a request with **no** token act as the dev user, for preflight and curl on your machine. A bad token is refused regardless. **Never set it on a hosted backend** | No — defaults to `false` |
+| `DEV_USER_ID` | The user a token-less request acts as when `AUTH_DISABLED=true` | No — has a built-in default |
+| `NEXT_PUBLIC_SUPABASE_URL` / `NEXT_PUBLIC_SUPABASE_ANON_KEY` | The frontend's sign-in client, in `apps/web/.env.local` (inlined at build time) | **Yes** (frontend) |
 | `GEMINI_API_KEY` | Google Gemini API key (primary LLM, and embeddings for long-term memory) | **Yes** |
 | `GROQ_API_KEY` | Groq API key (fallback LLM) | **Yes** |
 | `SEARCH_API_KEY` | Tavily key for web search | No — without it, search falls back to a keyless provider that returns encyclopaedic lookups rather than ranked web results |
 | `PICOVOICE_ACCESS_KEY` | Wake-word detection key | No — and not needed even for Phase 4. The shipped voice loop uses the browser (no key); wake word is optional and has two keyless alternatives, see `.env.example` |
-| `JWT_SECRET_KEY` | Session/JWT signing secret | No — not yet used |
-| `SESSION_SECRET` | Session signing secret | No — not yet used |
 
 No API keys, passwords, tokens, or other credentials are included in this document or in `.env.example` — only variable names and placeholder values.
 
@@ -890,12 +888,11 @@ No API keys, passwords, tokens, or other credentials are included in this docume
 
 ### Short-Term
 - **Deploy it.** Follow `docs/deployment.md`: create the Vercel and Render projects, set the environment variables, run `alembic upgrade head`, and send one real message through the deployed frontend.
-- Add real authentication (Supabase Auth), replacing the single seeded dev user. Everything is already scoped by `user_id`, so this stays a change to `get_current_user_id` rather than a migration of anything.
 - Grow `scripts/preflight.py` by one check per real incident. It is already the fastest way to tell whether the system actually works, and every check in it was earned by something that broke.
 - Decide whether TTS needs to follow STT off the browser. STT already has: `POST /voice/transcribe` takes over automatically wherever the browser's speech service is unreachable. `speechSynthesis` has not needed the same treatment because every browser implements it — but the voice inventory differs per platform, so a persona can sound like someone else on a different machine.
 
 ### Medium-Term
-- Real user authentication via Supabase Auth, replacing the single seeded dev user — memory is already scoped by `user_id` throughout, so this is expected to be a drop-in change to `get_current_user_id`.
+- Make the pinned model per-user. `POST /models/active` is process-wide, so with several accounts one user's pin changes the model for everyone.
 
 ### Long-Term
 
