@@ -5,6 +5,7 @@
 // each message), and /memory exposes a dashboard to view/edit/delete them.
 
 import type { Persona, PersonaInfo } from "@/lib/personas";
+import { authHeader } from "@/lib/supabase";
 
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
 
@@ -91,8 +92,8 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   let response: Response;
   try {
     response = await fetch(`${API_BASE_URL}${path}`, {
-      headers: { "Content-Type": "application/json" },
       ...init,
+      headers: { "Content-Type": "application/json", ...(await authHeader()) },
     });
   } catch {
     throw new ApiError(0, "Could not reach the backend. Is it running on " + API_BASE_URL + "?");
@@ -369,7 +370,11 @@ export async function uploadDocument(file: File): Promise<DocumentUploadResult> 
 
   let response: Response;
   try {
-    response = await fetch(`${API_BASE_URL}/documents`, { method: "POST", body: form });
+    response = await fetch(`${API_BASE_URL}/documents`, {
+      method: "POST",
+      body: form,
+      headers: await authHeader(),
+    });
   } catch {
     throw new ApiError(0, `Could not reach the backend. Is it running on ${API_BASE_URL}?`);
   }
@@ -544,7 +549,11 @@ export async function askAboutImage(
 
   let response: Response;
   try {
-    response = await fetch(`${API_BASE_URL}/vision`, { method: "POST", body: form });
+    response = await fetch(`${API_BASE_URL}/vision`, {
+      method: "POST",
+      body: form,
+      headers: await authHeader(),
+    });
   } catch {
     throw new ApiError(0, `Could not reach the backend. Is it running on ${API_BASE_URL}?`);
   }
@@ -583,7 +592,11 @@ export async function transcribe(blob: Blob, language?: string): Promise<string>
 
   let response: Response;
   try {
-    response = await fetch(`${API_BASE_URL}/voice/transcribe`, { method: "POST", body: form });
+    response = await fetch(`${API_BASE_URL}/voice/transcribe`, {
+      method: "POST",
+      body: form,
+      headers: await authHeader(),
+    });
   } catch {
     throw new ApiError(0, `Could not reach the backend. Is it running on ${API_BASE_URL}?`);
   }

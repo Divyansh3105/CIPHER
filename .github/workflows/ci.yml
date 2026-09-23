@@ -99,6 +99,11 @@ jobs:
         # The build is the check that catches what lint and tsc cannot --
         # the Suspense boundary a static route needs, for one.
         run: npm run build
+        env:
+          # src/lib/supabase.ts refuses to load without these, and they are
+          # inlined at build time. Placeholders: CI builds, it never signs in.
+          NEXT_PUBLIC_SUPABASE_URL: https://ci-placeholder.supabase.co
+          NEXT_PUBLIC_SUPABASE_ANON_KEY: ci-placeholder
 
   docker:
     name: Backend image builds

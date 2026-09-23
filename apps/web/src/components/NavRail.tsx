@@ -9,6 +9,7 @@
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import Icon, { type IconName } from "@/components/Icon";
+import { supabase } from "@/lib/supabase";
 
 const DESTINATIONS: { href: string; label: string; icon: IconName }[] = [
   { href: "/", label: "Chat", icon: "chat" },
@@ -63,6 +64,13 @@ export default function NavRail() {
       </div>
 
       <div className="flex flex-col items-center gap-2">
+        <button
+          type="button"
+          onClick={() => supabase.auth.signOut()}
+          className="mb-1 text-[10px] font-medium text-zinc-500 hover:text-zinc-200"
+        >
+          Sign out
+        </button>
         <span
           className="h-2 w-2 rounded-full bg-emerald-500/80 ring-2 ring-emerald-500/20"
           title="Local backend"

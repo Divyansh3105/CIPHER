@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
 import { Inter, JetBrains_Mono } from "next/font/google";
+import AuthGate from "@/components/AuthGate";
 import NavRail from "@/components/NavRail";
 import "./globals.css";
 
@@ -42,10 +43,12 @@ export default function RootLayout({ children }: LayoutProps<"/">) {
           document: every screen scrolls its own panes, and the page itself
           never does. */}
       <body className="h-full overflow-hidden bg-zinc-950 font-sans text-zinc-200">
-        <div className="flex h-full w-full overflow-hidden">
-          <NavRail />
-          <div className="flex min-w-0 flex-1 flex-col overflow-hidden">{children}</div>
-        </div>
+        <AuthGate>
+          <div className="flex h-full w-full overflow-hidden">
+            <NavRail />
+            <div className="flex min-w-0 flex-1 flex-col overflow-hidden">{children}</div>
+          </div>
+        </AuthGate>
       </body>
     </html>
   );
