@@ -1,6 +1,6 @@
 import logging
 
-from fastapi import FastAPI, Request
+from fastapi import Depends, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from sqlalchemy.exc import SQLAlchemyError
@@ -8,6 +8,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from app.api.agents import router as agents_router
 from app.api.automation import router as automation_router
 from app.api.chat import router as chat_router
+from app.api.deps import get_current_user_id
 from app.api.documents import router as documents_router
 from app.api.memory import router as memory_router
 from app.api.models import router as models_router
@@ -30,16 +31,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-app.include_router(chat_router)
-app.include_router(memory_router)
-app.include_router(models_router)
-app.include_router(documents_router)
-app.include_router(tools_router)
-app.include_router(agents_router)
-app.include_router(automation_router)
-app.include_router(vision_router)
-app.include_router(voice_router)
-app.include_router(personas_router)
+# Every router needs a signed-in user, including the ones whose handlers
+# never read the id: POST /models/active changes the model for everyone.
+# Only /health and /health/ready below are public.
+for router in (
+    chat_router, memory_router, models_router, documents_router, tools_router,
+    agents_router, automation_router, vision_router, voice_router, personas_router,
+):
+    app.include_router(router, dependencies=[Depends(get_current_user_id)])
 
 
 def _cors_headers(request: Request) -> dict[str, str]:

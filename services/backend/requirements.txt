@@ -12,7 +12,11 @@ sqlalchemy[asyncio]==2.0.52
 asyncpg==0.31.0
 alembic==1.19.1
 
-# ── LLM providers ─────────────────────────────
+# ── Auth ──────────────────────────────────────
+# Verifies Supabase's ES256 session tokens; [crypto] is what adds ES256.
+pyjwt[crypto]==2.15.0
+
+# ── LLM providers─────────────────────────────
 google-genai==2.21.0
 groq==1.7.0
 

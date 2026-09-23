@@ -52,7 +52,6 @@ class Settings(BaseSettings):
     # Supabase
     supabase_url: str | None = None
     supabase_key: str | None = None
-    supabase_jwt_secret: str | None = None
 
     # LLM providers
     gemini_api_key: str
@@ -73,12 +72,11 @@ class Settings(BaseSettings):
     #: Comma-separated name=executable pairs `open_app` may launch.
     automation_allowed_apps: str = ""
 
-    # Security
-    jwt_secret_key: str | None = None
-    session_secret: str | None = None
-
-    # Phase 1: auth is deferred. Every request is attributed to this single
-    # seeded dev user. Replace with real JWT-derived user ids when auth lands.
+    # Auth is Supabase JWTs (app/api/deps.py). AUTH_DISABLED lets a request
+    # with NO token act as the seeded dev user -- for preflight and curl on
+    # your own machine. Never set it on a hosted backend: it would hand
+    # anyone with the URL the dev user's memories and your API quota.
+    auth_disabled: bool = False
     dev_user_id: UUID = Field(default=UUID("00000000-0000-0000-0000-000000000001"))
 
 
