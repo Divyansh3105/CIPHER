@@ -786,6 +786,7 @@ flowchart LR
 - [x] Real user authentication via Supabase Auth (every router guarded; `/health` stays public)
 - [x] Per-user model pins — one account pinning a model no longer changes what answers everyone else
 - [x] Streaming replies (`POST /chat/message/stream`, server-sent events). The fallback model only takes over before the first token, and ULTRON streams whole sentences, each one checked by its safety filter before it is shown
+- [x] Pooled database connections. Every request used to open a new connection to Supabase (~1.2s each from India to Tokyo); now a small pool stays open, with prepared-statement caching chosen by pooler port, since caching is safe in session mode and broken in transaction mode
 - [x] Gemini's free quota (20 requests a day per model) is kept for the reply you read: agent routing, tool choice and memory extraction go to Groq first, and a provider that reports it is out of quota is skipped until it has rested instead of costing a failed call on every message
 
 ---
@@ -873,7 +874,7 @@ All variables are read from a single repo-root `.env` file (see `.env.example` f
 | `NEXT_PUBLIC_API_URL` | Base URL the frontend uses to call the backend | No — defaults to `http://localhost:8000` |
 | `SUPABASE_URL` | Supabase project URL; the backend fetches the auth signing keys from it | **Yes** |
 | `SUPABASE_KEY` | Supabase **anon** key, sent when fetching signing keys | **Yes** |
-| `DATABASE_URL` | Postgres connection string used at request time (Supavisor transaction-mode pooler recommended) | **Yes** |
+| `DATABASE_URL` | Postgres connection string used at request time. Session-mode pooler (port 5432) recommended; the transaction-mode pooler (6543) works too, with statement caching turned off automatically | **Yes** |
 | `MIGRATION_DATABASE_URL` | Non-pooled Postgres connection used by Alembic for schema changes | No — falls back to `DATABASE_URL` |
 | `AUTH_DISABLED` | Lets a request with **no** token act as the dev user, for preflight and curl on your machine. A bad token is refused regardless. **Never set it on a hosted backend** | No — defaults to `false` |
 | `DEV_USER_ID` | The user a token-less request acts as when `AUTH_DISABLED=true` | No — has a built-in default |

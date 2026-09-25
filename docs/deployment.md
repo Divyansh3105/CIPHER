@@ -76,7 +76,7 @@ deleting a file in a later layer does not remove it from an earlier one.
    | --- | --- |
    | `APP_ENV` | `production` |
    | `FRONTEND_URL` | your Vercel URL, exactly, no trailing slash |
-   | `DATABASE_URL` | the transaction-mode pooler (port 6543) |
+   | `DATABASE_URL` | the session-mode pooler (port 5432). The transaction-mode pooler (6543) also works, just slower -- `app/core/database.py` explains |
    | `MIGRATION_DATABASE_URL` | the session-mode pooler (port 5432) |
    | `AUTOMATION_ENABLED` | **leave unset** — see the warning below |
    | `AUTH_DISABLED` | **leave unset** — with it on, anyone with the URL is the dev user |
