@@ -784,6 +784,7 @@ flowchart LR
 - [x] Backend automated test suite (303 tests, in-memory database, no live credentials needed)
 
 - [x] Real user authentication via Supabase Auth (every router guarded; `/health` stays public)
+- [x] Per-user model pins — one account pinning a model no longer changes what answers everyone else
 
 ---
 
@@ -890,9 +891,6 @@ No API keys, passwords, tokens, or other credentials are included in this docume
 - **Deploy it.** Follow `docs/deployment.md`: create the Vercel and Render projects, set the environment variables, run `alembic upgrade head`, and send one real message through the deployed frontend.
 - Grow `scripts/preflight.py` by one check per real incident. It is already the fastest way to tell whether the system actually works, and every check in it was earned by something that broke.
 - Decide whether TTS needs to follow STT off the browser. STT already has: `POST /voice/transcribe` takes over automatically wherever the browser's speech service is unreachable. `speechSynthesis` has not needed the same treatment because every browser implements it — but the voice inventory differs per platform, so a persona can sound like someone else on a different machine.
-
-### Medium-Term
-- Make the pinned model per-user. `POST /models/active` is process-wide, so with several accounts one user's pin changes the model for everyone.
 
 ### Long-Term
 
