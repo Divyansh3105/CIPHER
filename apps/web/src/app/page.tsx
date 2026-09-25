@@ -25,7 +25,7 @@ import {
   listModels,
   listPersonas,
   type ModelInfo,
-  sendMessage,
+  streamMessage,
   setActiveModel,
 } from "@/lib/api";
 import { DEFAULT_PERSONA, FALLBACK_PERSONAS, type Persona, personaLabel } from "@/lib/personas";
@@ -95,6 +95,9 @@ export default function Home() {
   const [activeId, setActiveId] = useState<string | null>(null);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [pending, setPending] = useState(false);
+  // True once the reply's first text has arrived: the bubble itself then
+  // shows progress, and "thinking…" underneath it would be wrong.
+  const [streaming, setStreaming] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<Notice | null>(null);
   const [deletingId, setDeletingId] = useState<string | null>(null);
@@ -527,10 +530,37 @@ export default function Home() {
     pendingRef.current = true;
     setPending(true);
 
+    // The reply streams into a placeholder bubble, which the saved message
+    // replaces at the end. Replaced rather than kept: the saved text can
+    // differ from what streamed (ULTRON's filter swaps in a refusal), and
+    // the saved message carries the real id, citations and recalled chips.
+    const streamingId = `streaming-${crypto.randomUUID()}`;
+    let started = false;
     try {
-      const result = await sendMessage(content, activeId ?? undefined, persona);
+      const result = await streamMessage(content, activeId ?? undefined, persona, (text) => {
+        if (!started) {
+          started = true;
+          setStreaming(true);
+          setMessages((prev) => [
+            ...prev,
+            {
+              id: streamingId,
+              role: "assistant",
+              content: text,
+              persona,
+              created_at: new Date().toISOString(),
+              recalled_memories: [],
+              citations: [],
+            },
+          ]);
+          return;
+        }
+        setMessages((prev) =>
+          prev.map((m) => (m.id === streamingId ? { ...m, content: m.content + text } : m))
+        );
+      });
       setActiveId(result.conversation_id);
-      setMessages((prev) => [...prev, result.message]);
+      setMessages((prev) => [...prev.filter((m) => m.id !== streamingId), result.message]);
       // Keep the floor open for a follow-up without the wake word.
       if (handsFree) armWakeWindow();
       if (voiceReplies) {
@@ -560,10 +590,14 @@ export default function Home() {
       }
       refreshConversations();
     } catch (err) {
+      // Whatever streamed was never saved, so it must not stay on screen
+      // looking like part of the conversation.
+      setMessages((prev) => prev.filter((m) => m.id !== streamingId));
       setError(err instanceof ApiError ? err.message : "Something went wrong sending that message.");
     } finally {
       pendingRef.current = false;
       setPending(false);
+      setStreaming(false);
     }
   }
 
@@ -719,7 +753,7 @@ export default function Home() {
 
         <MessageList
           messages={messages}
-          pending={pending}
+          pending={pending && !streaming}
           activePersonaLabel={activeLabel}
           personas={personas}
         />

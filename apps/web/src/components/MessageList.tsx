@@ -17,10 +17,12 @@ export default function MessageList({
   personas: PersonaInfo[];
 }) {
   const bottomRef = useRef<HTMLDivElement>(null);
+  // Follows a streaming reply as it grows, not only new messages.
+  const tailLength = messages.at(-1)?.content.length ?? 0;
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages.length, pending]);
+  }, [messages.length, tailLength, pending]);
 
   if (messages.length === 0 && !pending) {
     return (

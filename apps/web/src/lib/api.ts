@@ -113,15 +113,61 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return response.json() as Promise<T>;
 }
 
-export function sendMessage(
+// Sends a message and streams the reply: `onDelta` gets each new piece of
+// text as it is written, and the promise resolves with the saved message --
+// the same body POST /chat/message returns.
+//
+// Only the final `done` event means the reply was saved. If the stream
+// ends any other way this throws, and whatever onDelta already showed must
+// be discarded: it is not in the conversation. A `done` can also carry
+// different text from what streamed (ULTRON's filter replacing a reply),
+// so the caller should render done's message, not the concatenated deltas.
+export async function streamMessage(
   content: string,
-  conversationId?: string,
-  persona?: Persona
+  conversationId: string | undefined,
+  persona: Persona,
+  onDelta: (text: string) => void
 ): Promise<ChatMessageResponse> {
-  return request<ChatMessageResponse>("/chat/message", {
-    method: "POST",
-    body: JSON.stringify({ content, conversation_id: conversationId ?? null, persona: persona ?? null }),
-  });
+  let response: Response;
+  try {
+    response = await fetch(`${API_BASE_URL}/chat/message/stream`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...(await authHeader()) },
+      body: JSON.stringify({ content, conversation_id: conversationId ?? null, persona }),
+    });
+  } catch {
+    throw new ApiError(0, `Could not reach the backend. Is it running on ${API_BASE_URL}?`);
+  }
+  // Rate limits, a conversation that is not yours and the like fail before
+  // streaming starts, as ordinary JSON errors.
+  if (!response.ok || !response.body) {
+    let detail = response.statusText;
+    try {
+      detail = (await response.json()).detail ?? detail;
+    } catch {
+      // not JSON; keep statusText
+    }
+    throw new ApiError(response.status, detail);
+  }
+
+  const reader = response.body.pipeThrough(new TextDecoderStream()).getReader();
+  let buffer = "";
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buffer += value;
+    // Events end with a blank line; the last piece may be half an event.
+    const events = buffer.split("\n\n");
+    buffer = events.pop() ?? "";
+    for (const raw of events) {
+      if (!raw.startsWith("data: ")) continue;
+      const event = JSON.parse(raw.slice("data: ".length));
+      if (event.type === "delta") onDelta(event.text);
+      else if (event.type === "error") throw new ApiError(event.status, event.detail);
+      else if (event.type === "done") return event as ChatMessageResponse;
+    }
+  }
+  throw new ApiError(0, "The reply was cut off before it finished, so it was not saved.");
 }
 
 export function listConversations(): Promise<ConversationSummary[]> {
