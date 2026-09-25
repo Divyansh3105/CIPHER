@@ -48,7 +48,7 @@ class ResearchAgent(Agent):
         if not tools:
             raise AgentError("No search tools are available.")
 
-        plan = await ToolPlanner(self._router).plan(context.message, tools)
+        plan = await ToolPlanner(self._router).plan(context.message, tools, user_id=context.user_id)
         if not plan.tool_name:
             # The orchestrator routed here but the agent found nothing worth
             # looking up. Reported as a real outcome rather than an error:

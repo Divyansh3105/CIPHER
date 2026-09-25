@@ -15,9 +15,14 @@ Phase 4 adds a runtime pin (app/llm/registry.py). Two rules make it safe:
 2. The pin is process-lifetime only, never persisted. A restart always
    returns to the configured defaults, so it is impossible to strand
    yourself on a model you meant to try for one message.
+3. The pin is per user. It used to be one slot on this process-wide router,
+   which was fine while every request was the same dev user and wrong the
+   moment there were two accounts: one user's pin changed the model that
+   answered everyone else.
 """
 import logging
 from functools import lru_cache
+from uuid import UUID
 
 from app.core.config import Settings, get_settings
 from app.llm.base import LLMMessage, LLMProvider, LLMProviderError, LLMResponse
@@ -35,43 +40,50 @@ class LLMRouter:
         self._primary = primary
         self._fallback = fallback
         self._providers = {primary.name: primary, fallback.name: fallback}
-        self._pinned: ModelSpec | None = None
+        self._pins: dict[UUID, ModelSpec] = {}
 
     # --- runtime pin ----------------------------------------------------
 
-    def pin(self, spec: ModelSpec) -> None:
+    def pin(self, user_id: UUID, spec: ModelSpec) -> None:
         if spec.provider not in self._providers:
             # Unreachable via resolve_model() -- every registry entry names a
             # registered provider -- but a registry edit could break it, and
             # the failure should surface here rather than at request time.
             raise ValueError(f"No provider named {spec.provider!r} is registered on this router")
-        logger.info("Pinning model to %s (%s)", spec.id, spec.provider)
-        self._pinned = spec
+        logger.info("Pinning model to %s (%s) for user %s", spec.id, spec.provider, user_id)
+        self._pins[user_id] = spec
 
-    def unpin(self) -> None:
-        logger.info("Unpinning model; back to default routing")
-        self._pinned = None
+    def unpin(self, user_id: UUID) -> None:
+        logger.info("Unpinning model for user %s; back to default routing", user_id)
+        self._pins.pop(user_id, None)
 
-    @property
-    def pinned(self) -> ModelSpec | None:
-        return self._pinned
+    def pinned_for(self, user_id: UUID | None) -> ModelSpec | None:
+        return self._pins.get(user_id) if user_id is not None else None
 
     def default_model_id(self) -> str:
         return GEMINI_DEFAULT_MODEL if self._primary.name == "gemini" else GROQ_DEFAULT_MODEL
 
     # --- generation -----------------------------------------------------
 
-    async def generate(self, messages: list[LLMMessage]) -> tuple[LLMResponse, bool]:
+    async def generate(
+        self, messages: list[LLMMessage], *, user_id: UUID | None
+    ) -> tuple[LLMResponse, bool]:
         """Returns (response, fell_back). `fell_back` is always False when a
         model is pinned, because a pinned model does not fall back at all.
+
+        `user_id` is required, not defaulted: a call site that forgot it would
+        quietly answer a pinned user on the default model, which is the exact
+        failure rule 1 exists to prevent. Pass None only where there is no
+        user at all (the golden-set scripts).
         """
-        if self._pinned is not None:
-            provider = self._providers[self._pinned.provider]
+        pinned = self.pinned_for(user_id)
+        if pinned is not None:
+            provider = self._providers[pinned.provider]
             try:
-                return await provider.agenerate(messages, model=self._pinned.id), False
+                return await provider.agenerate(messages, model=pinned.id), False
             except LLMProviderError as exc:
                 raise ModelUnavailableError(
-                    f"{self._pinned.display_name} is pinned and failed: {exc}. "
+                    f"{pinned.display_name} is pinned and failed: {exc}. "
                     f"Nothing was answered on a different model -- switch back to the default to continue."
                 ) from exc
 
@@ -98,7 +110,7 @@ def build_llm_router(settings: Settings) -> LLMRouter:
 def get_llm_router() -> LLMRouter:
     """Process-wide singleton so provider clients aren't rebuilt per-request.
 
-    Also what makes the runtime pin behave: it lives on this one instance,
-    so it survives across requests and dies with the process.
+    Also what makes the runtime pins behave: they live on this one instance,
+    so they survive across requests and die with the process.
     """
     return build_llm_router(get_settings())

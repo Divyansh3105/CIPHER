@@ -23,6 +23,7 @@ import json
 import logging
 import re
 from dataclasses import dataclass
+from uuid import UUID
 
 from app.llm.base import LLMMessage, LLMProviderError
 from app.llm.router import LLMRouter
@@ -115,7 +116,7 @@ class ToolPlanner:
     def __init__(self, llm_router: LLMRouter) -> None:
         self._router = llm_router
 
-    async def plan(self, message: str, tools: list[Tool]) -> ToolPlan:
+    async def plan(self, message: str, tools: list[Tool], *, user_id: UUID | None) -> ToolPlan:
         """Decide which tool, if any, should run for this message.
 
         Never raises: a planner failure means "no tool", because the reply
@@ -132,7 +133,9 @@ class ToolPlanner:
         prompt = _PLANNER_PROMPT.format(tools=catalogue, message=message[:2000])
 
         try:
-            response, _ = await self._router.generate([LLMMessage(role="user", content=prompt)])
+            response, _ = await self._router.generate(
+                [LLMMessage(role="user", content=prompt)], user_id=user_id
+            )
         except LLMProviderError as exc:
             logger.warning("Tool planning failed, continuing without a tool: %s", exc)
             return ToolPlan(None, reason=f"planner call failed: {exc}")

@@ -9,9 +9,11 @@ A 404 here is a real answer, not a failure: "I don't have that model, here
 is what I have" is more useful than quietly loading something else.
 """
 import logging
+from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException
 
+from app.api.deps import get_current_user_id
 from app.llm.registry import MODEL_REGISTRY, UnknownModelError, is_reset_phrase, resolve_model
 from app.llm.router import LLMRouter, get_llm_router
 from app.models.schemas import ActiveModel, ModelInfo, ModelsResponse, ModelSwapRequest
@@ -21,8 +23,8 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/models", tags=["models"])
 
 
-def _active(llm_router: LLMRouter) -> ActiveModel:
-    pinned = llm_router.pinned
+def _active(llm_router: LLMRouter, user_id: UUID) -> ActiveModel:
+    pinned = llm_router.pinned_for(user_id)
     default_id = llm_router.default_model_id()
     if pinned is None:
         return ActiveModel(
@@ -42,9 +44,12 @@ def _active(llm_router: LLMRouter) -> ActiveModel:
 
 
 @router.get("", response_model=ModelsResponse)
-async def list_models(llm_router: LLMRouter = Depends(get_llm_router)) -> ModelsResponse:
+async def list_models(
+    llm_router: LLMRouter = Depends(get_llm_router),
+    user_id: UUID = Depends(get_current_user_id),
+) -> ModelsResponse:
     return ModelsResponse(
-        active=_active(llm_router),
+        active=_active(llm_router, user_id),
         available=[
             ModelInfo(
                 id=spec.id,
@@ -62,10 +67,11 @@ async def list_models(llm_router: LLMRouter = Depends(get_llm_router)) -> Models
 async def set_active_model(
     payload: ModelSwapRequest,
     llm_router: LLMRouter = Depends(get_llm_router),
+    user_id: UUID = Depends(get_current_user_id),
 ) -> ActiveModel:
     if is_reset_phrase(payload.spoken):
-        llm_router.unpin()
-        return _active(llm_router)
+        llm_router.unpin(user_id)
+        return _active(llm_router, user_id)
 
     try:
         spec = resolve_model(payload.spoken)
@@ -76,11 +82,14 @@ async def set_active_model(
         logger.info("Refused unknown model %r", payload.spoken)
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
-    llm_router.pin(spec)
-    return _active(llm_router)
+    llm_router.pin(user_id, spec)
+    return _active(llm_router, user_id)
 
 
 @router.delete("/active", response_model=ActiveModel)
-async def clear_active_model(llm_router: LLMRouter = Depends(get_llm_router)) -> ActiveModel:
-    llm_router.unpin()
-    return _active(llm_router)
+async def clear_active_model(
+    llm_router: LLMRouter = Depends(get_llm_router),
+    user_id: UUID = Depends(get_current_user_id),
+) -> ActiveModel:
+    llm_router.unpin(user_id)
+    return _active(llm_router, user_id)

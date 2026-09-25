@@ -102,7 +102,7 @@ async def describe(
     ]
 
     try:
-        response, _ = await llm_router.generate(messages)
+        response, _ = await llm_router.generate(messages, user_id=user_id)
     except LLMProviderError as exc:
         # Includes the "this model cannot see" case from the Groq provider,
         # which is a real answer rather than an outage -- so it is reported

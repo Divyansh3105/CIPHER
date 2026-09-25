@@ -46,8 +46,7 @@ async def test_a_named_tool_is_planned_with_a_standalone_query():
     tool = RecordingTool("web_search")
 
     plan = await _planner('{"tool": "web_search", "query": "pgvector HNSW index"}').plan(
-        "hey what's that pgvector index thing called again", [tool]
-    )
+        "hey what's that pgvector index thing called again", [tool], user_id=None)
 
     assert plan.tool_name == "web_search"
     # The query is a good standalone search, not the message verbatim.
@@ -56,7 +55,7 @@ async def test_a_named_tool_is_planned_with_a_standalone_query():
 
 @pytest.mark.asyncio
 async def test_null_means_no_tool():
-    plan = await _planner('{"tool": null}').plan("what do you think about tabs vs spaces", [RecordingTool()])
+    plan = await _planner('{"tool": null}').plan("what do you think about tabs vs spaces", [RecordingTool()], user_id=None)
 
     assert plan.tool_name is None
 
@@ -69,8 +68,7 @@ async def test_a_hallucinated_tool_name_is_refused_not_matched():
     tool = RecordingTool("web_search")
 
     plan = await _planner('{"tool": "search_the_internet", "query": "x"}').plan(
-        "look up the weather in Delhi please", [tool]
-    )
+        "look up the weather in Delhi please", [tool], user_id=None)
 
     assert plan.tool_name is None
     assert "unknown tool" in plan.reason
@@ -79,8 +77,7 @@ async def test_a_hallucinated_tool_name_is_refused_not_matched():
 @pytest.mark.asyncio
 async def test_a_tool_chosen_without_a_query_is_refused():
     plan = await _planner('{"tool": "web_search"}').plan(
-        "look up the weather in Delhi please", [RecordingTool("web_search")]
-    )
+        "look up the weather in Delhi please", [RecordingTool("web_search")], user_id=None)
 
     assert plan.tool_name is None
 
@@ -89,8 +86,7 @@ async def test_a_tool_chosen_without_a_query_is_refused():
 async def test_json_wrapped_in_a_code_fence_is_still_parsed():
     """Models fence JSON despite being told not to."""
     plan = await _planner('```json\n{"tool": "web_search", "query": "delhi weather"}\n```').plan(
-        "look up the weather in Delhi please", [RecordingTool("web_search")]
-    )
+        "look up the weather in Delhi please", [RecordingTool("web_search")], user_id=None)
 
     assert plan.tool_name == "web_search"
 
@@ -98,8 +94,7 @@ async def test_json_wrapped_in_a_code_fence_is_still_parsed():
 @pytest.mark.asyncio
 async def test_unparseable_planner_output_means_no_tool_not_an_error():
     plan = await _planner("I think you should search the web!").plan(
-        "look up the weather in Delhi please", [RecordingTool("web_search")]
-    )
+        "look up the weather in Delhi please", [RecordingTool("web_search")], user_id=None)
 
     assert plan.tool_name is None
     assert "JSON" in plan.reason
@@ -117,7 +112,7 @@ async def test_a_planner_outage_degrades_to_no_tool():
 
     planner = ToolPlanner(LLMRouter(primary=Failing(), fallback=Failing()))
 
-    plan = await planner.plan("look up the weather in Delhi", [RecordingTool("web_search")])
+    plan = await planner.plan("look up the weather in Delhi", [RecordingTool("web_search")], user_id=None)
 
     assert plan.tool_name is None
     assert "failed" in plan.reason
@@ -132,7 +127,7 @@ async def test_small_talk_never_reaches_the_planner(message):
     provider = ScriptedProvider(['{"tool": "web_search", "query": "x"}'])
     planner = ToolPlanner(LLMRouter(primary=provider, fallback=provider))
 
-    plan = await planner.plan(message, [RecordingTool("web_search")])
+    plan = await planner.plan(message, [RecordingTool("web_search")], user_id=None)
 
     assert plan.tool_name is None
     assert provider.calls == []
@@ -143,7 +138,7 @@ async def test_no_tools_available_means_no_planner_call():
     provider = ScriptedProvider(['{"tool": "web_search", "query": "x"}'])
     planner = ToolPlanner(LLMRouter(primary=provider, fallback=provider))
 
-    plan = await planner.plan("please look up the population of Delhi", [])
+    plan = await planner.plan("please look up the population of Delhi", [], user_id=None)
 
     assert plan.tool_name is None
     assert provider.calls == []

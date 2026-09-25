@@ -110,12 +110,14 @@ def _parse_facts(raw: str) -> list[str]:
     return facts[:_MAX_EXTRACTED_FACTS]
 
 
-async def _extract_facts(llm_router: LLMRouter, user_text: str) -> list[str]:
+async def _extract_facts(llm_router: LLMRouter, user_text: str, user_id: UUID) -> list[str]:
     if len(user_text.split()) < MIN_WORDS_FOR_EXTRACTION:
         return []
     prompt = _EXTRACTION_PROMPT.format(user_text=user_text)
     try:
-        response, _fell_back = await llm_router.generate([LLMMessage(role="user", content=prompt)])
+        response, _fell_back = await llm_router.generate(
+            [LLMMessage(role="user", content=prompt)], user_id=user_id
+        )
     except LLMProviderError as exc:
         logger.warning("Memory extraction: LLM call failed: %s", exc)
         return []
@@ -151,7 +153,7 @@ class MemoryWriter:
             if explicit:
                 candidates.append((explicit, "explicit"))
 
-            for fact in await _extract_facts(self._llm_router, user_text):
+            for fact in await _extract_facts(self._llm_router, user_text, user_id):
                 candidates.append((fact, "extracted"))
 
             if not candidates:

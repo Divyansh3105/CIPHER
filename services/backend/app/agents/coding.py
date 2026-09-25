@@ -62,7 +62,7 @@ class CodingAgent(Agent):
             messages.append(LLMMessage(role=role, content=content))
 
         try:
-            response, _ = await self._router.generate(messages)
+            response, _ = await self._router.generate(messages, user_id=context.user_id)
         except LLMProviderError as exc:
             raise AgentError(f"The coding specialist could not be reached: {exc}") from exc
 

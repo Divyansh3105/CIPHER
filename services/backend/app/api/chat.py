@@ -208,7 +208,7 @@ async def send_message(
     ]
 
     try:
-        response, fell_back = await llm_router.generate(llm_messages)
+        response, fell_back = await llm_router.generate(llm_messages, user_id=user_id)
     except ModelUnavailableError as exc:
         # Separated from the generic case on purpose: this is a model the
         # user explicitly pinned, and 409 + the pin's own message says which

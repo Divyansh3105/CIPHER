@@ -4,12 +4,22 @@ The behaviour under test that is easy to get wrong: a *pinned* model must
 never fall back. Default routing falling back to Groq is a feature; a pinned
 model falling back is a lie about which model answered.
 """
+from uuid import uuid4
+
 import pytest
 
 from app.llm.base import LLMMessage, LLMProvider, LLMProviderError, LLMResponse
 from app.llm.registry import ModelUnavailableError, resolve_model
+from app.api.deps import get_current_user_id
 from app.llm.router import LLMRouter, get_llm_router
 from app.main import app
+
+ME = uuid4()
+
+
+def _me():
+    """The user the `client` fixture authenticates as."""
+    return app.dependency_overrides[get_current_user_id]()
 
 
 class NamedProvider(LLMProvider):
@@ -58,9 +68,9 @@ def swap_router(gemini, groq):
 @pytest.mark.asyncio
 async def test_pinning_sends_the_pinned_model_id_to_the_right_provider(gemini, groq):
     router = LLMRouter(primary=gemini, fallback=groq)
-    router.pin(resolve_model("qwen"))
+    router.pin(ME, resolve_model("qwen"))
 
-    response, fell_back = await router.generate([LLMMessage(role="user", content="hi")])
+    response, fell_back = await router.generate([LLMMessage(role="user", content="hi")], user_id=ME)
 
     # Qwen lives on Groq, so the *fallback* provider must have taken it --
     # a pin selects a provider, it is not "primary with a different name".
@@ -77,10 +87,10 @@ async def test_pinned_model_does_not_fall_back(groq):
     """
     failing_gemini = NamedProvider("gemini", fails=True)
     router = LLMRouter(primary=failing_gemini, fallback=groq)
-    router.pin(resolve_model("gemini 3.8 flash"))
+    router.pin(ME, resolve_model("gemini 3.8 flash"))
 
     with pytest.raises(ModelUnavailableError) as excinfo:
-        await router.generate([LLMMessage(role="user", content="hi")])
+        await router.generate([LLMMessage(role="user", content="hi")], user_id=ME)
 
     assert groq.models == []  # never consulted
     assert "Gemini 3.8 Flash" in str(excinfo.value)
@@ -90,10 +100,10 @@ async def test_pinned_model_does_not_fall_back(groq):
 async def test_unpinning_restores_fallback(gemini, groq):
     failing_gemini = NamedProvider("gemini", fails=True)
     router = LLMRouter(primary=failing_gemini, fallback=groq)
-    router.pin(resolve_model("gemini 3.8 flash"))
-    router.unpin()
+    router.pin(ME, resolve_model("gemini 3.8 flash"))
+    router.unpin(ME)
 
-    response, fell_back = await router.generate([LLMMessage(role="user", content="hi")])
+    response, fell_back = await router.generate([LLMMessage(role="user", content="hi")], user_id=ME)
 
     assert fell_back is True
     assert response.provider == "groq"
@@ -105,10 +115,10 @@ async def test_a_fresh_router_is_never_pinned(gemini, groq):
     router (a new process) always starts on the configured default.
     """
     pinned = LLMRouter(primary=gemini, fallback=groq)
-    pinned.pin(resolve_model("qwen"))
-    assert pinned.pinned is not None
+    pinned.pin(ME, resolve_model("qwen"))
+    assert pinned.pinned_for(ME) is not None
 
-    assert LLMRouter(primary=gemini, fallback=groq).pinned is None
+    assert LLMRouter(primary=gemini, fallback=groq).pinned_for(ME) is None
 
 
 def test_pinning_a_spec_with_no_registered_provider_raises(gemini, groq):
@@ -116,7 +126,7 @@ def test_pinning_a_spec_with_no_registered_provider_raises(gemini, groq):
 
     router = LLMRouter(primary=gemini, fallback=groq)
     with pytest.raises(ValueError):
-        router.pin(ModelSpec(id="x", provider="nonexistent", display_name="X", aliases=("x",)))
+        router.pin(ME, ModelSpec(id="x", provider="nonexistent", display_name="X", aliases=("x",)))
 
 
 # --- HTTP ---------------------------------------------------------------
@@ -144,7 +154,7 @@ async def test_post_active_pins_a_spoken_name(client, swap_router):
     assert body["pinned"] is True
     assert body["id"] == "gemini-3.8-flash"
     assert body["display_name"] == "Gemini 3.8 Flash"
-    assert swap_router.pinned.id == "gemini-3.8-flash"
+    assert swap_router.pinned_for(_me()).id == "gemini-3.8-flash"
 
 
 @pytest.mark.asyncio
@@ -155,7 +165,7 @@ async def test_post_active_refuses_an_unknown_model_and_changes_nothing(client, 
     detail = response.json()["detail"]
     assert "Gemini 3.8 Flash" in detail  # tells you what does exist
     # The refusal must not have half-applied.
-    assert swap_router.pinned is None
+    assert swap_router.pinned_for(_me()) is None
 
 
 @pytest.mark.asyncio
@@ -163,7 +173,7 @@ async def test_refusal_does_not_downgrade_an_existing_pin(client, swap_router):
     await client.post("/models/active", json={"spoken": "qwen"})
     await client.post("/models/active", json={"spoken": "gemini 4 flash"})
 
-    assert swap_router.pinned.id == "qwen/qwen3.8-27b"
+    assert swap_router.pinned_for(_me()).id == "qwen/qwen3.8-27b"
 
 
 @pytest.mark.asyncio
@@ -174,7 +184,7 @@ async def test_post_active_with_a_reset_phrase_unpins(client, swap_router):
 
     assert response.status_code == 200
     assert response.json()["pinned"] is False
-    assert swap_router.pinned is None
+    assert swap_router.pinned_for(_me()) is None
 
 
 @pytest.mark.asyncio
@@ -185,7 +195,7 @@ async def test_delete_active_unpins(client, swap_router):
 
     assert response.status_code == 200
     assert response.json()["pinned"] is False
-    assert swap_router.pinned is None
+    assert swap_router.pinned_for(_me()) is None
 
 
 @pytest.mark.asyncio
@@ -205,7 +215,7 @@ async def test_chat_reports_409_when_the_pinned_model_fails(client, groq):
     saying so is the whole point of pinning one.
     """
     router = LLMRouter(primary=NamedProvider("gemini", fails=True), fallback=groq)
-    router.pin(resolve_model("gemini 3.8 flash"))
+    router.pin(_me(), resolve_model("gemini 3.8 flash"))
     app.dependency_overrides[get_llm_router] = lambda: router
     try:
         response = await client.post("/chat/message", json={"content": "hello"})
@@ -215,3 +225,42 @@ async def test_chat_reports_409_when_the_pinned_model_fails(client, groq):
     assert response.status_code == 409
     assert "Gemini 3.8 Flash" in response.json()["detail"]
     assert groq.models == []
+
+
+# --- per-user -------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_one_users_pin_does_not_touch_another_user(gemini, groq):
+    router = LLMRouter(primary=gemini, fallback=groq)
+    router.pin(ME, resolve_model("qwen"))
+
+    response, _ = await router.generate([LLMMessage(role="user", content="hi")], user_id=uuid4())
+
+    assert response.provider == "gemini"  # default routing, not ME's qwen
+    assert groq.models == []
+
+
+@pytest.mark.asyncio
+async def test_a_pin_over_http_is_invisible_to_a_different_account(client, swap_router, gemini):
+    """The bug this replaced: the pin was one slot on a process-wide router,
+    so with two accounts one user's "switch to qwen" answered everyone else.
+    """
+    await client.post("/models/active", json={"spoken": "qwen"})
+
+    someone_else = uuid4()
+    app.dependency_overrides[get_current_user_id] = lambda: someone_else
+    # A chat creates rows owned by the user, so they need to exist.
+    from app.core.database import get_session
+    from app.models.db import User
+
+    async for session in app.dependency_overrides[get_session]():
+        session.add(User(id=someone_else, email="other@example.com", preferences={}))
+        await session.commit()
+
+    models = (await client.get("/models")).json()
+    chat = await client.post("/chat/message", json={"content": "hello"})
+
+    assert models["active"]["pinned"] is False
+    assert chat.json()["model_used"] != "qwen/qwen3.8-27b"
+    assert swap_router.pinned_for(someone_else) is None

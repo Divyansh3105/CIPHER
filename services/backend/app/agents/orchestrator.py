@@ -114,7 +114,9 @@ class Orchestrator:
         prompt = _ROUTER_PROMPT.format(agents=catalogue, message=context.message[:2000])
 
         try:
-            response, _ = await self._router.generate([LLMMessage(role="user", content=prompt)])
+            response, _ = await self._router.generate(
+                [LLMMessage(role="user", content=prompt)], user_id=context.user_id
+            )
         except LLMProviderError as exc:
             # A routing outage means answering directly, which is what the
             # assistant did for five phases. Strictly better than an error.

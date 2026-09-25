@@ -27,7 +27,7 @@ async def test_primary_success_does_not_call_fallback():
     fallback = FakeProvider("fallback")
     router = LLMRouter(primary=primary, fallback=fallback)
 
-    response, fell_back = await router.generate([LLMMessage(role="user", content="hello")])
+    response, fell_back = await router.generate([LLMMessage(role="user", content="hello")], user_id=None)
 
     assert response.content == "from primary"
     assert response.provider == "primary"
@@ -42,7 +42,7 @@ async def test_primary_failure_falls_back():
     fallback = FakeProvider("fallback", reply="from fallback")
     router = LLMRouter(primary=primary, fallback=fallback)
 
-    response, fell_back = await router.generate([LLMMessage(role="user", content="hello")])
+    response, fell_back = await router.generate([LLMMessage(role="user", content="hello")], user_id=None)
 
     assert response.content == "from fallback"
     assert response.provider == "fallback"
@@ -58,4 +58,4 @@ async def test_both_providers_failing_raises():
     router = LLMRouter(primary=primary, fallback=fallback)
 
     with pytest.raises(LLMProviderError):
-        await router.generate([LLMMessage(role="user", content="hello")])
+        await router.generate([LLMMessage(role="user", content="hello")], user_id=None)

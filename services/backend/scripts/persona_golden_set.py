@@ -58,7 +58,7 @@ async def run(personas: list[Persona]) -> None:
             print(f"[{category}] persona={config.display_name}")
             print(f"PROMPT: {prompt}")
 
-            response, fell_back = await router.generate(messages)
+            response, fell_back = await router.generate(messages, user_id=None)
             reply = response.content
 
             verdict = "n/a (no filter)"
