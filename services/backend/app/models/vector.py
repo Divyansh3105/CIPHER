@@ -9,9 +9,10 @@ trap entirely.
 Core invariant enforced by this module: **asyncpg must never see a `vector`
 value bound or fetched through the ORM.** asyncpg has no codec for the
 `vector` OID, and registering one (via `pgvector.asyncpg.register_vector`)
-costs a type-introspection round trip per *connection* -- which, combined
-with `NullPool` + Supabase's Supavisor transaction-mode pooler (see
-app/core/database.py), means a round trip per request. So:
+costs a type-introspection round trip per *connection* -- which, when this
+was written, meant one per request (app/core/database.py opened a fresh
+connection for each). The engine pools connections now, but every new or
+recycled connection would still pay it, for no benefit over a text cast. So:
 
   - Every `Memory.embedding` column is declared `deferred=True` -- a plain
     `select(Memory)` never fetches it.
