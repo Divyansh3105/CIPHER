@@ -116,7 +116,7 @@ async def _extract_facts(llm_router: LLMRouter, user_text: str, user_id: UUID) -
     prompt = _EXTRACTION_PROMPT.format(user_text=user_text)
     try:
         response, _fell_back = await llm_router.generate(
-            [LLMMessage(role="user", content=prompt)], user_id=user_id
+            [LLMMessage(role="user", content=prompt)], user_id=user_id, internal=True
         )
     except LLMProviderError as exc:
         logger.warning("Memory extraction: LLM call failed: %s", exc)

@@ -1,9 +1,17 @@
 """Routes chat requests to the primary provider, falling back on failure.
 
-Default routing is deliberately simple: always try the primary (Gemini)
-first, and only use the fallback (Groq) if the primary raises. Section 4's
-"quick message -> fast model" routing is a later refinement once we have
-signals (message length/intent) worth routing on.
+Default routing tries the primary (Gemini) first and uses the fallback
+(Groq) only if it raises -- for the reply the user reads. Internal calls
+(`internal=True`: agent routing, tool choice, memory extraction) go the
+other way round, Groq first. Gemini's free tier allows each model about 20
+requests a day, and one chat turn made up to three internal calls on top of
+the reply, so the quota ran out after a handful of messages. Groq's limits
+are far higher, and those calls produce a word or a JSON list nobody reads.
+
+A provider that reports it is out of quota (LLMProviderError.retry_after)
+rests: default routing skips it until then, instead of paying a failed call
+on every message. If every provider is resting they are all tried anyway --
+a stale guess about quota must never be the reason nothing answers.
 
 Phase 4 adds a runtime pin (app/llm/registry.py). Two rules make it safe:
 
@@ -21,6 +29,7 @@ Phase 4 adds a runtime pin (app/llm/registry.py). Two rules make it safe:
    answered everyone else.
 """
 import logging
+import time
 from collections.abc import AsyncIterator
 from functools import lru_cache
 from uuid import UUID
@@ -42,6 +51,8 @@ class LLMRouter:
         self._fallback = fallback
         self._providers = {primary.name: primary, fallback.name: fallback}
         self._pins: dict[UUID, ModelSpec] = {}
+        #: Provider name -> time.monotonic() before which default routing skips it.
+        self._resting_until: dict[str, float] = {}
 
     # --- runtime pin ----------------------------------------------------
 
@@ -64,10 +75,26 @@ class LLMRouter:
     def default_model_id(self) -> str:
         return GEMINI_DEFAULT_MODEL if self._primary.name == "gemini" else GROQ_DEFAULT_MODEL
 
+    # --- default routing ----------------------------------------------
+
+    def _order(self, internal: bool) -> tuple[list[LLMProvider], LLMProvider]:
+        """(providers to try in order, the one that counts as not falling back)."""
+        preferred = [self._fallback, self._primary] if internal else [self._primary, self._fallback]
+        now = time.monotonic()
+        awake = [p for p in preferred if self._resting_until.get(p.name, 0.0) <= now]
+        return (awake or preferred), preferred[0]
+
+    def _failed(self, provider: LLMProvider, exc: LLMProviderError, remaining: int) -> None:
+        if exc.retry_after:
+            self._resting_until[provider.name] = time.monotonic() + exc.retry_after
+            logger.warning("%s is out of quota; skipping it for %.0fs", provider.name, exc.retry_after)
+        if remaining:
+            logger.warning("LLM provider %s failed, falling back: %s", provider.name, exc)
+
     # --- generation -----------------------------------------------------
 
     async def generate(
-        self, messages: list[LLMMessage], *, user_id: UUID | None
+        self, messages: list[LLMMessage], *, user_id: UUID | None, internal: bool = False
     ) -> tuple[LLMResponse, bool]:
         """Returns (response, fell_back). `fell_back` is always False when a
         model is pinned, because a pinned model does not fall back at all.
@@ -76,6 +103,10 @@ class LLMRouter:
         quietly answer a pinned user on the default model, which is the exact
         failure rule 1 exists to prevent. Pass None only where there is no
         user at all (the golden-set scripts).
+
+        `internal` marks a call whose output nobody reads directly; see the
+        module docstring. A pin still wins over it: a user who named a model
+        gets that model everywhere, exactly as before.
         """
         pinned = self.pinned_for(user_id)
         if pinned is not None:
@@ -85,27 +116,26 @@ class LLMRouter:
             except LLMProviderError as exc:
                 raise _pinned_failed(pinned, exc) from exc
 
-        try:
-            return await self._primary.agenerate(messages), False
-        except LLMProviderError as primary_error:
-            logger.warning("Primary LLM provider (%s) failed, falling back: %s", self._primary.name, primary_error)
+        order, preferred = self._order(internal)
+        errors = []
+        for i, provider in enumerate(order):
             try:
-                return await self._fallback.agenerate(messages), True
-            except LLMProviderError as fallback_error:
-                raise LLMProviderError(
-                    f"Both providers failed. primary={primary_error} fallback={fallback_error}"
-                ) from fallback_error
+                return await provider.agenerate(messages), provider is not preferred
+            except LLMProviderError as exc:
+                self._failed(provider, exc, remaining=len(order) - i - 1)
+                errors.append(f"{provider.name}={exc}")
+        raise LLMProviderError("All providers failed. " + " ".join(errors))
 
     async def stream(
         self, messages: list[LLMMessage], *, user_id: UUID | None
     ) -> AsyncIterator[tuple[LLMResponse, bool]]:
         """generate(), in pieces: yields (piece, fell_back) per chunk of text.
 
-        Same rules as generate, plus one that streaming forces: the fallback
-        only takes over if the primary fails BEFORE its first piece. Once text
-        has reached the user it cannot be taken back, and starting again on
-        another model would splice two answers together -- so a failure after
-        that point is raised as a failure.
+        Same rules as generate, plus one that streaming forces: a fallback
+        only takes over if the provider before it fails BEFORE its first
+        piece. Once text has reached the user it cannot be taken back, and
+        starting again on another model would splice two answers together --
+        so a failure after that point is raised as a failure.
         """
         pinned = self.pinned_for(user_id)
         if pinned is not None:
@@ -117,25 +147,21 @@ class LLMRouter:
                 raise _pinned_failed(pinned, exc) from exc
             return
 
-        started = False
-        try:
-            async for piece in self._primary.astream(messages):
-                started = True
-                yield piece, False
-            return
-        except LLMProviderError as primary_error:
-            if started:
-                raise
-            logger.warning("Primary LLM provider (%s) failed, falling back: %s", self._primary.name, primary_error)
-            failure = primary_error
-
-        try:
-            async for piece in self._fallback.astream(messages):
-                yield piece, True
-        except LLMProviderError as fallback_error:
-            raise LLMProviderError(
-                f"Both providers failed. primary={failure} fallback={fallback_error}"
-            ) from fallback_error
+        order, preferred = self._order(internal=False)
+        errors = []
+        for i, provider in enumerate(order):
+            started = False
+            try:
+                async for piece in provider.astream(messages):
+                    started = True
+                    yield piece, provider is not preferred
+                return
+            except LLMProviderError as exc:
+                if started:
+                    raise
+                self._failed(provider, exc, remaining=len(order) - i - 1)
+                errors.append(f"{provider.name}={exc}")
+        raise LLMProviderError("All providers failed. " + " ".join(errors))
 
 
 def _pinned_failed(pinned: ModelSpec, exc: LLMProviderError) -> ModelUnavailableError:

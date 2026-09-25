@@ -115,7 +115,7 @@ class Orchestrator:
 
         try:
             response, _ = await self._router.generate(
-                [LLMMessage(role="user", content=prompt)], user_id=context.user_id
+                [LLMMessage(role="user", content=prompt)], user_id=context.user_id, internal=True
             )
         except LLMProviderError as exc:
             # A routing outage means answering directly, which is what the

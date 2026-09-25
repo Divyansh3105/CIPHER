@@ -149,7 +149,7 @@ async def _check_extraction_quality(llm_router) -> None:
     print()
     for message, should_extract in EXTRACTION_CASES:
         prompt = _EXTRACTION_PROMPT.format(user_text=message)
-        response, fell_back = await llm_router.generate([LLMMessage(role="user", content=prompt)], user_id=None)
+        response, fell_back = await llm_router.generate([LLMMessage(role="user", content=prompt)], user_id=None, internal=True)
         facts = _parse_facts(response.content)
         got_something = len(facts) > 0
         verdict = "OK" if got_something == should_extract else "MISMATCH"

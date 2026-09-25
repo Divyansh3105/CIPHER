@@ -134,7 +134,7 @@ class ToolPlanner:
 
         try:
             response, _ = await self._router.generate(
-                [LLMMessage(role="user", content=prompt)], user_id=user_id
+                [LLMMessage(role="user", content=prompt)], user_id=user_id, internal=True
             )
         except LLMProviderError as exc:
             logger.warning("Tool planning failed, continuing without a tool: %s", exc)

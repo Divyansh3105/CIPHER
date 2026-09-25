@@ -15,6 +15,35 @@ from app.llm.base import LLMMessage, LLMProvider, LLMProviderError, LLMResponse
 
 DEFAULT_MODEL = "gemini-3.6-flash"
 
+# ponytail: a per-day quota resets at midnight Pacific. Resting an hour and
+# trying again costs one failed call per hour, which is simpler than
+# timezone arithmetic (and python:slim images ship without a tz database).
+DAILY_QUOTA_REST_SECONDS = 3600.0
+DEFAULT_REST_SECONDS = 60.0
+
+
+def _failure(model: str, exc: APIError) -> LLMProviderError:
+    """An LLMProviderError, carrying how long to stay away if this was a quota 429."""
+    retry_after = None
+    if exc.code == 429:
+        details = (exc.details or {}).get("error", {}).get("details", []) if isinstance(exc.details, dict) else []
+        retry_after = DEFAULT_REST_SECONDS
+        for detail in details:
+            kind = detail.get("@type", "")
+            if kind.endswith("QuotaFailure") and any(
+                "PerDay" in v.get("quotaId", "") for v in detail.get("violations", [])
+            ):
+                # The error's own retryDelay (~30-60s) is wrong for a daily
+                # quota: retrying then just fails again.
+                retry_after = DAILY_QUOTA_REST_SECONDS
+                break
+            if kind.endswith("RetryInfo"):
+                try:
+                    retry_after = float(str(detail.get("retryDelay", "")).rstrip("s"))
+                except ValueError:
+                    pass
+    return LLMProviderError(f"Gemini request failed ({model}): {exc}", retry_after=retry_after)
+
 
 class GeminiProvider(LLMProvider):
     name = "gemini"
@@ -53,7 +82,7 @@ class GeminiProvider(LLMProvider):
                 model=model, contents=contents, config=config
             )
         except APIError as exc:
-            raise LLMProviderError(f"Gemini request failed ({model}): {exc}") from exc
+            raise _failure(model, exc) from exc
 
         text = response.text
         if not text:
@@ -74,7 +103,7 @@ class GeminiProvider(LLMProvider):
                     got_text = True
                     yield LLMResponse(content=chunk.text, model=model, provider=self.name)
         except APIError as exc:
-            raise LLMProviderError(f"Gemini request failed ({model}): {exc}") from exc
+            raise _failure(model, exc) from exc
 
         if not got_text:
             raise LLMProviderError(f"Gemini returned an empty response ({model})")

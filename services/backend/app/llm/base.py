@@ -45,7 +45,16 @@ class LLMResponse:
 
 
 class LLMProviderError(Exception):
-    """Raised when a provider fails to produce a response (network, auth, rate limit, ...)."""
+    """Raised when a provider fails to produce a response (network, auth, rate limit, ...).
+
+    `retry_after` is set when the provider said it is out of quota and for
+    how long, in seconds. The router uses it to stop sending default-routed
+    calls there until then, rather than paying a failed call on each one.
+    """
+
+    def __init__(self, message: str, *, retry_after: float | None = None) -> None:
+        super().__init__(message)
+        self.retry_after = retry_after
 
 
 class LLMProvider(ABC):
