@@ -786,6 +786,7 @@ flowchart LR
 - [x] Real user authentication via Supabase Auth (every router guarded; `/health` stays public)
 - [x] Per-user model pins — one account pinning a model no longer changes what answers everyone else
 - [x] Streaming replies (`POST /chat/message/stream`, server-sent events). The fallback model only takes over before the first token, and ULTRON streams whole sentences, each one checked by its safety filter before it is shown
+- [x] Gemini's free quota (20 requests a day per model) is kept for the reply you read: agent routing, tool choice and memory extraction go to Groq first, and a provider that reports it is out of quota is skipped until it has rested instead of costing a failed call on every message
 
 ---
 
