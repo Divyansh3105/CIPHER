@@ -785,6 +785,7 @@ flowchart LR
 
 - [x] Real user authentication via Supabase Auth (every router guarded; `/health` stays public)
 - [x] Per-user model pins — one account pinning a model no longer changes what answers everyone else
+- [x] Streaming replies (`POST /chat/message/stream`, server-sent events). The fallback model only takes over before the first token, and ULTRON streams whole sentences, each one checked by its safety filter before it is shown
 
 ---
 
