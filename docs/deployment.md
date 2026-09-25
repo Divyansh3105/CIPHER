@@ -134,12 +134,23 @@ Then check, in this order:
 ```bash
 curl https://<backend>/health          # process is up
 curl https://<backend>/health/ready    # database is reachable
-curl https://<backend>/models          # keys are loaded
+curl https://<backend>/models          # 401 "Sign in required." -- auth is on
+curl -si -X OPTIONS https://<backend>/chat/conversations \
+  -H "Origin: https://<frontend>" -H "Access-Control-Request-Method: GET" \
+  | grep -i access-control-allow-origin   # must echo your Vercel URL
 ```
 
-Then send one real message through the deployed frontend. That exercises
-CORS, the database, the LLM keys and the memory pipeline in one go, which no
-individual endpoint check does.
+A 200 from `/models` is a failure, not a pass: it means the backend is
+serving without auth, most likely because `AUTH_DISABLED` is set. Every
+route except the two health checks needs a signed-in user, so there is no
+curl-able "keys are loaded" check any more.
+
+If the CORS line prints nothing, the new `FRONTEND_URL` is not live yet --
+the old deploy keeps serving until the new one passes its health check.
+
+Then sign up on the deployed frontend and send one real message. That is the
+only check that exercises sign-in, CORS, the database, the LLM keys and the
+memory pipeline together.
 
 ---
 
