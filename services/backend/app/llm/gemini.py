@@ -5,6 +5,8 @@ original architecture doc) returned 404 "no longer available to new users"
 as of 2026-09-02 -- verified live against the account's actual API key via
 client.models.list() and a real generateContent call before pinning this.
 """
+from collections.abc import AsyncIterator
+
 from google import genai
 from google.genai import types
 from google.genai.errors import APIError
@@ -22,8 +24,8 @@ class GeminiProvider(LLMProvider):
         self._client = genai.Client(api_key=api_key)
         self._model = model
 
-    async def agenerate(self, messages: list[LLMMessage], model: str | None = None) -> LLMResponse:
-        model = model or self._model
+    def _request(self, messages: list[LLMMessage]) -> tuple[list[types.Content], types.GenerateContentConfig]:
+        """Shared by agenerate and astream, so the two can never send different requests."""
         system_parts = [m.content for m in messages if m.role == "system"]
         system_instruction = "\n\n".join(system_parts) or None
 
@@ -41,12 +43,14 @@ class GeminiProvider(LLMProvider):
             contents.append(
                 types.Content(role="model" if m.role == "assistant" else "user", parts=parts)
             )
+        return contents, types.GenerateContentConfig(system_instruction=system_instruction)
 
+    async def agenerate(self, messages: list[LLMMessage], model: str | None = None) -> LLMResponse:
+        model = model or self._model
+        contents, config = self._request(messages)
         try:
             response = await self._client.aio.models.generate_content(
-                model=model,
-                contents=contents,
-                config=types.GenerateContentConfig(system_instruction=system_instruction),
+                model=model, contents=contents, config=config
             )
         except APIError as exc:
             raise LLMProviderError(f"Gemini request failed ({model}): {exc}") from exc
@@ -56,3 +60,21 @@ class GeminiProvider(LLMProvider):
             raise LLMProviderError(f"Gemini returned an empty response ({model})")
 
         return LLMResponse(content=text, model=model, provider=self.name)
+
+    async def astream(self, messages: list[LLMMessage], model: str | None = None) -> AsyncIterator[LLMResponse]:
+        model = model or self._model
+        contents, config = self._request(messages)
+        got_text = False
+        try:
+            stream = await self._client.aio.models.generate_content_stream(
+                model=model, contents=contents, config=config
+            )
+            async for chunk in stream:
+                if chunk.text:
+                    got_text = True
+                    yield LLMResponse(content=chunk.text, model=model, provider=self.name)
+        except APIError as exc:
+            raise LLMProviderError(f"Gemini request failed ({model}): {exc}") from exc
+
+        if not got_text:
+            raise LLMProviderError(f"Gemini returned an empty response ({model})")

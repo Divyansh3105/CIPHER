@@ -4,6 +4,7 @@ Swapping Gemini -> Claude -> OpenAI later should be a matter of adding a new
 class here, not rewriting the chat endpoint (docs/architecture.md, Section 4).
 """
 from abc import ABC, abstractmethod
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Literal
 
@@ -64,3 +65,13 @@ class LLMProvider(ABC):
         another request through the shared provider singleton.
         """
         raise NotImplementedError
+
+    async def astream(self, messages: list[LLMMessage], model: str | None = None) -> AsyncIterator[LLMResponse]:
+        """The reply in pieces: each LLMResponse's `content` is only the new text.
+
+        The default yields the whole reply as one piece, so a provider (or a
+        test fake) with no streaming API still works everywhere a stream is
+        expected. Raises LLMProviderError like agenerate, including partway
+        through -- callers must not assume a failure means nothing was sent.
+        """
+        yield await self.agenerate(messages, model=model)

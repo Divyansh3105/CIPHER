@@ -6,6 +6,8 @@ of 2026-09-02 -- Groq's Llama chat models are gone from this account's
 client.models.list() entirely. Verified live with a real chat.completions
 call before pinning this.
 """
+from collections.abc import AsyncIterator
+
 from groq import APIError, AsyncGroq
 
 from app.llm.base import LLMMessage, LLMProvider, LLMProviderError, LLMResponse
@@ -20,8 +22,8 @@ class GroqProvider(LLMProvider):
         self._client = AsyncGroq(api_key=api_key)
         self._model = model
 
-    async def agenerate(self, messages: list[LLMMessage], model: str | None = None) -> LLMResponse:
-        model = model or self._model
+    @staticmethod
+    def _refuse_images(messages: list[LLMMessage], model: str) -> None:
         if any(m.images for m in messages):
             # Refused rather than dropped. Sending the text alone would
             # produce a confident answer about an image this model never
@@ -30,6 +32,10 @@ class GroqProvider(LLMProvider):
                 f"{model} cannot accept images. Pin a vision-capable model, or leave the "
                 f"default routing to Gemini."
             )
+
+    async def agenerate(self, messages: list[LLMMessage], model: str | None = None) -> LLMResponse:
+        model = model or self._model
+        self._refuse_images(messages, model)
         try:
             response = await self._client.chat.completions.create(
                 model=model,
@@ -44,3 +50,26 @@ class GroqProvider(LLMProvider):
             raise LLMProviderError(f"Groq returned an empty response ({model})")
 
         return LLMResponse(content=text, model=model, provider=self.name)
+
+    async def astream(self, messages: list[LLMMessage], model: str | None = None) -> AsyncIterator[LLMResponse]:
+        model = model or self._model
+        self._refuse_images(messages, model)
+        got_text = False
+        try:
+            stream = await self._client.chat.completions.create(
+                model=model,
+                messages=[{"role": m.role, "content": m.content} for m in messages],
+                stream=True,
+            )
+            async for chunk in stream:
+                # Only `content`: reasoning models also stream a separate
+                # `reasoning` delta, which is the model thinking, not the reply.
+                text = chunk.choices[0].delta.content if chunk.choices else None
+                if text:
+                    got_text = True
+                    yield LLMResponse(content=text, model=model, provider=self.name)
+        except APIError as exc:
+            raise LLMProviderError(f"Groq request failed ({model}): {exc}") from exc
+
+        if not got_text:
+            raise LLMProviderError(f"Groq returned an empty response ({model})")

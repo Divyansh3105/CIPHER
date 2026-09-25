@@ -35,6 +35,7 @@ DESIGN RULE: FALSE POSITIVES COST MORE THAN FALSE NEGATIVES HERE.
     handful of well-tested rule families over a long keyword list.
 """
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
 
 
@@ -151,3 +152,46 @@ def check_output(text: str) -> FilterResult:
             return FilterResult(False, "intrusion_instructions")
 
     return FilterResult(True)
+
+
+class StreamScreen:
+    """Screens a streamed reply one finished sentence at a time.
+
+    check_output judges every sentence on its own, with nothing carried from
+    one sentence to the next, so checking sentences as they complete reaches
+    the same verdict as checking the whole reply at the end -- and nothing
+    reaches the user before it has been checked. tests/test_stream_screen.py
+    holds that equivalence to account.
+
+    A sentence counts as finished only once the whitespace after it has
+    arrived AND more text follows. A chunk can end halfway through that
+    whitespace, and releasing on a partial match would split the text at a
+    different place than check_output does.
+    """
+
+    def __init__(self, check: Callable[[str], FilterResult] = check_output) -> None:
+        self._check = check
+        self._buffer = ""
+
+    def feed(self, text: str) -> tuple[str, FilterResult]:
+        """Returns (text safe to show now, verdict). Empty text means keep waiting."""
+        self._buffer += text
+        cut = 0
+        for boundary in _SENTENCE_SPLIT.finditer(self._buffer):
+            if boundary.end() < len(self._buffer):
+                cut = boundary.end()
+        if not cut:
+            return "", FilterResult(True)
+        ready, self._buffer = self._buffer[:cut], self._buffer[cut:]
+        return self._screened(ready)
+
+    def flush(self) -> tuple[str, FilterResult]:
+        """The last, unterminated sentence, once the stream has ended."""
+        ready, self._buffer = self._buffer, ""
+        return self._screened(ready) if ready else ("", FilterResult(True))
+
+    def _screened(self, ready: str) -> tuple[str, FilterResult]:
+        # Text that failed is never handed back, so no caller can show it by
+        # forgetting to look at the verdict first.
+        verdict = self._check(ready)
+        return (ready if verdict.allowed else ""), verdict

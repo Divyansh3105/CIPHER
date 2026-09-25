@@ -21,6 +21,7 @@ Phase 4 adds a runtime pin (app/llm/registry.py). Two rules make it safe:
    answered everyone else.
 """
 import logging
+from collections.abc import AsyncIterator
 from functools import lru_cache
 from uuid import UUID
 
@@ -82,10 +83,7 @@ class LLMRouter:
             try:
                 return await provider.agenerate(messages, model=pinned.id), False
             except LLMProviderError as exc:
-                raise ModelUnavailableError(
-                    f"{pinned.display_name} is pinned and failed: {exc}. "
-                    f"Nothing was answered on a different model -- switch back to the default to continue."
-                ) from exc
+                raise _pinned_failed(pinned, exc) from exc
 
         try:
             return await self._primary.agenerate(messages), False
@@ -97,6 +95,54 @@ class LLMRouter:
                 raise LLMProviderError(
                     f"Both providers failed. primary={primary_error} fallback={fallback_error}"
                 ) from fallback_error
+
+    async def stream(
+        self, messages: list[LLMMessage], *, user_id: UUID | None
+    ) -> AsyncIterator[tuple[LLMResponse, bool]]:
+        """generate(), in pieces: yields (piece, fell_back) per chunk of text.
+
+        Same rules as generate, plus one that streaming forces: the fallback
+        only takes over if the primary fails BEFORE its first piece. Once text
+        has reached the user it cannot be taken back, and starting again on
+        another model would splice two answers together -- so a failure after
+        that point is raised as a failure.
+        """
+        pinned = self.pinned_for(user_id)
+        if pinned is not None:
+            provider = self._providers[pinned.provider]
+            try:
+                async for piece in provider.astream(messages, model=pinned.id):
+                    yield piece, False
+            except LLMProviderError as exc:
+                raise _pinned_failed(pinned, exc) from exc
+            return
+
+        started = False
+        try:
+            async for piece in self._primary.astream(messages):
+                started = True
+                yield piece, False
+            return
+        except LLMProviderError as primary_error:
+            if started:
+                raise
+            logger.warning("Primary LLM provider (%s) failed, falling back: %s", self._primary.name, primary_error)
+            failure = primary_error
+
+        try:
+            async for piece in self._fallback.astream(messages):
+                yield piece, True
+        except LLMProviderError as fallback_error:
+            raise LLMProviderError(
+                f"Both providers failed. primary={failure} fallback={fallback_error}"
+            ) from fallback_error
+
+
+def _pinned_failed(pinned: ModelSpec, exc: LLMProviderError) -> ModelUnavailableError:
+    return ModelUnavailableError(
+        f"{pinned.display_name} is pinned and failed: {exc}. "
+        f"Nothing was answered on a different model -- switch back to the default to continue."
+    )
 
 
 def build_llm_router(settings: Settings) -> LLMRouter:
