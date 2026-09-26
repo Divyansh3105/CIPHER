@@ -39,7 +39,14 @@ function SignIn() {
         ? await supabase.auth.signInWithPassword({ email, password })
         : await supabase.auth.signUp({ email, password });
     setBusy(false);
-    if (error) {
+    if (error?.code === "email_address_invalid") {
+      // Supabase checks that an address can actually receive mail, not just
+      // that it looks like one, so a made-up address is refused here.
+      setMessage({
+        tone: "error",
+        text: `${error.message}. Sign-up needs a real address you can receive email at — a confirmation link is sent there.`,
+      });
+    } else if (error) {
       setMessage({ tone: "error", text: error.message });
     } else if (mode === "up" && !data.session) {
       // Supabase's "Confirm email" setting is on: no session until the link is clicked.
