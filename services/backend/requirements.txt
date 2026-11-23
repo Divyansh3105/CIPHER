@@ -1,36 +1,36 @@
 # ── Web framework ─────────────────────────────
-fastapi==0.141.1
-uvicorn[standard]==0.52.4
+fastapi==0.165.0
+uvicorn[standard]==0.54.0
 
 # ── Config & validation ───────────────────────
-pydantic==2.13.5
-pydantic-settings==2.15.0
-python-dotenv==1.2.3
+pydantic==2.14.4
+pydantic-settings==2.16.3
+python-dotenv==1.2.4
 
 # ── Database ──────────────────────────────────
-sqlalchemy[asyncio]==2.0.52
-asyncpg==0.31.0
-alembic==1.19.1
+sqlalchemy[asyncio]==2.1.9
+asyncpg==0.32.0
+alembic==1.20.1
 
 # ── Auth ──────────────────────────────────────
 # Verifies Supabase's ES256 session tokens; [crypto] is what adds ES256.
-pyjwt[crypto]==2.15.0
+pyjwt[crypto]==2.15.1
 
 # ── LLM providers─────────────────────────────
-google-genai==2.21.0
+google-genai==3.6.1
 groq==1.7.0
 
 # ── RAG / documents (Phase 5) ─────────────────
 # Pure-Python, no system libraries, no service. pypdf also carries the page
 # numbers that make a citation actionable ("page 4") rather than vague.
-pypdf==6.1.1
+pypdf==7.1.1
 python-docx==1.2.0
 # Required by FastAPI to parse multipart uploads; without it POST /documents
 # raises at import time rather than at request time.
-python-multipart==0.0.20
+python-multipart==0.0.34
 
 # ── Testing ───────────────────────────────────
-pytest==8.4.2
-pytest-asyncio==1.2.0
+pytest==9.2.0
+pytest-asyncio==1.5.0
 httpx==0.28.1
-aiosqlite==0.21.0
+aiosqlite==0.22.1
